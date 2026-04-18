@@ -11,7 +11,10 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Reflection;
 using System;
+using static ModLoader.LogSystem;
 
 namespace Config
 {
@@ -39,15 +42,23 @@ namespace Config
         private Rectangle _editorRect;
         private Rectangle _statusRect;
         private Rectangle _saveRect;
+        private Rectangle _reloadFileRect;
         private Rectangle _reloadRect;
+        private Rectangle _validateRect;
+        private Rectangle _restoreBakRect;
         private Rectangle _refreshRect;
         private Rectangle _closeRect;
         private Rectangle _fileScrollbarTrackRect;
         private Rectangle _fileScrollbarThumbRect;
         private Rectangle _fileFilterRect;
+        private Rectangle _editorSearchRect;
 
         private readonly List<ConfigFileItem> _files = new List<ConfigFileItem>();
         private readonly List<int> _visibleFileIndices = new List<int>();
+        private readonly List<FileListRow> _visibleRows = new List<FileListRow>();
+        private readonly List<GroupBucket> _groupBuckets = new List<GroupBucket>();
+        private readonly HashSet<string> _expandedGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<string> _recentPaths = new List<string>();
         private int _selectedFileIndex = -1;
         private int _fileScroll;
         private int _editorTopLine;
@@ -68,10 +79,54 @@ namespace Config
         private readonly List<string> _cachedLines = new List<string>();
         private readonly List<int> _lineStarts = new List<int>();
         private int _lastHotReloadPollTick;
-        private ulong _lastFileListFingerprint;
         private DateTime _selectedFileLastWriteUtc = DateTime.MinValue;
         private string _fileFilterText = "";
         private bool _focusFileFilter;
+        private string _editorSearchText = "";
+        private bool _focusEditorSearch;
+        private readonly List<int> _searchMatchIndices = new List<int>();
+        private int _activeSearchMatch = -1;
+        private bool _showRecentTab;
+        private Rectangle _filesTabRect;
+        private Rectangle _recentTabRect;
+        private string _lastValidationMessage = "";
+        private Color _lastValidationColor = Color.LightGray;
+        private int _lastDiffChanged;
+        private int _lastDiffAdded;
+        private int _lastDiffRemoved;
+
+        private sealed class UndoState
+        {
+            public string Text = "";
+            public int Caret;
+            public int TopLine;
+        }
+        private sealed class FileListRow
+        {
+            public bool IsGroup;
+            public string GroupKey;
+            public string GroupLabel;
+            public int FileIndex = -1;
+        }
+        private sealed class GroupBucket
+        {
+            public string Key;
+            public string Label;
+            public readonly List<int> FileIndices = new List<int>();
+        }
+        private sealed class UndoHistory
+        {
+            public readonly Stack<UndoState> Undo = new Stack<UndoState>();
+            public readonly Stack<UndoState> Redo = new Stack<UndoState>();
+        }
+        private readonly Dictionary<string, UndoHistory> _undoByPath = new Dictionary<string, UndoHistory>(StringComparer.OrdinalIgnoreCase);
+        private readonly object _scanLock = new object();
+        private bool _scanInProgress;
+        private bool _hasPendingScanResult;
+        private List<ConfigFileItem> _pendingScanItems;
+        private string _pendingOldPath;
+        private bool _firstDrawTraced;
+        private bool _firstInputTraced;
 
         private const int ButtonHeight = 36;
         private const int ButtonWidth = 140;
@@ -87,6 +142,12 @@ namespace Config
         private const int FileScrollbarMinThumbHeight = 28;
         private const int HotReloadPollMs = 1000;
         private const int InputBoxHeight = 30;
+        private const int MaxEnumeratedDirectories = 5000;
+        private const int PaneGutter = 10;
+        private const int MaxRecentFiles = 24;
+        private const int MaxUndoStatesPerFile = 100;
+        private static bool HideLeftHeaderAndFilter = false;
+        private static bool HideLeftFileListContent = false;
 
         public ConfigScreen(CastleMinerZGame game) : base(true, true)
         {
@@ -99,7 +160,8 @@ namespace Config
         {
             base.OnPushed();
             IsOpen = true;
-            RefreshFileList();
+            DebugTrace("ConfigScreen pushed.");
+            BeginRefreshFileList();
         }
 
         public override void OnPoped()
@@ -107,37 +169,66 @@ namespace Config
             base.OnPoped();
             IsOpen = false;
             CaptureMouse = false;
+            _undoByPath.Clear();
+            DebugTrace("ConfigScreen popped.");
         }
 
         protected override void OnDraw(GraphicsDevice device, SpriteBatch spriteBatch, GameTime gameTime)
         {
-            EnsureInit(device);
-            Layout(device);
-            PollHotReload();
+            try
+            {
+                EnsureInit(device);
+                Layout(device);
+                ApplyPendingScanResult();
+                PollHotReload();
 
-            _blinkTime = gameTime.TotalGameTime.TotalSeconds;
+                if (!_firstDrawTraced)
+                {
+                    _firstDrawTraced = true;
+                    DebugTrace("OnDraw first frame reached.");
+                }
 
-            spriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp, null, null);
+                _blinkTime = gameTime.TotalGameTime.TotalSeconds;
 
-            spriteBatch.Draw(_white, Screen.Adjuster.ScreenRect, new Color(0, 0, 0, 190));
-            DrawPanel(spriteBatch);
-            DrawTitle(spriteBatch);
-            DrawStatus(spriteBatch);
-            DrawButtons(spriteBatch);
-            DrawFiles(spriteBatch);
-            DrawEditor(spriteBatch);
+                spriteBatch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp, null, null);
 
-            spriteBatch.End();
+                spriteBatch.Draw(_white, Screen.Adjuster.ScreenRect, new Color(0, 0, 0, 190));
+                DrawPanel(spriteBatch);
+                DrawTitle(spriteBatch);
+                DrawStatus(spriteBatch);
+                DrawButtons(spriteBatch);
+                DrawFiles(spriteBatch);
+                DrawEditor(spriteBatch);
+
+                spriteBatch.End();
+            }
+            catch (Exception ex)
+            {
+                DebugTrace("OnDraw exception: " + ex.GetType().Name + ": " + ex.Message);
+                SetStatus("Config draw error: " + ex.Message, Color.OrangeRed);
+            }
         }
 
         protected override bool OnChar(GameTime gameTime, char c)
         {
-            if (_focusFileFilter)
+            if (!HideLeftHeaderAndFilter && _focusFileFilter)
             {
                 if (!char.IsControl(c))
                 {
                     _fileFilterText += c;
+                    DebugTrace($"Filter char '{c}' -> \"{_fileFilterText}\"");
                     RebuildVisibleFileIndices(true);
+                }
+
+                return false;
+            }
+
+            if (_focusEditorSearch)
+            {
+                if (!char.IsControl(c))
+                {
+                    _editorSearchText += c;
+                    RebuildSearchMatches();
                 }
 
                 return false;
@@ -169,6 +260,12 @@ namespace Config
             if (!CastleMinerZGame.Instance.IsActive)
                 return false;
 
+            if (!_firstInputTraced)
+            {
+                _firstInputTraced = true;
+                DebugTrace("OnPlayerInput first call reached.");
+            }
+
             var mousePoint = input.Mouse.Position;
             bool leftDown = input.Mouse.LeftButtonDown;
             bool leftPressed = input.Mouse.LeftButtonPressed || (leftDown && !_mouseLeftWasDown);
@@ -198,24 +295,54 @@ namespace Config
                 return false;
             }
 
+            if (ctrlDown && input.Keyboard.WasKeyPressed(Keys.Z))
+            {
+                UndoEdit();
+                return false;
+            }
+
+            if (ctrlDown && input.Keyboard.WasKeyPressed(Keys.Y))
+            {
+                RedoEdit();
+                return false;
+            }
+
+            if (ctrlDown && input.Keyboard.WasKeyPressed(Keys.F))
+            {
+                _focusEditor = false;
+                _focusFileFilter = false;
+                _focusEditorSearch = true;
+                return false;
+            }
+
             if (input.Keyboard.WasKeyPressed(Keys.F5))
             {
-                RefreshFileList();
+                BeginRefreshFileList();
+                return false;
+            }
+
+            if (input.Keyboard.WasKeyPressed(Keys.F3) || (_focusEditorSearch && input.Keyboard.WasKeyPressed(Keys.Enter)))
+            {
+                JumpToNextSearchMatch();
                 return false;
             }
 
             if (input.Mouse.DeltaWheel != 0 && _filesRect.Contains(mousePoint))
             {
+                if (HideLeftFileListContent)
+                    return false;
+
                 _focusEditor = false;
                 ScrollFileListBy(-Math.Sign(input.Mouse.DeltaWheel) * 3);
                 return false;
             }
 
-            if (_focusFileFilter)
+            if (!HideLeftHeaderAndFilter && _focusFileFilter)
             {
                 if (input.Keyboard.WasKeyPressed(Keys.Back) && _fileFilterText.Length > 0)
                 {
                     _fileFilterText = _fileFilterText.Substring(0, _fileFilterText.Length - 1);
+                    DebugTrace($"Filter backspace -> \"{_fileFilterText}\"");
                     RebuildVisibleFileIndices(true);
                     return false;
                 }
@@ -223,7 +350,25 @@ namespace Config
                 if (input.Keyboard.WasKeyPressed(Keys.Delete) && _fileFilterText.Length > 0)
                 {
                     _fileFilterText = "";
+                    DebugTrace("Filter cleared.");
                     RebuildVisibleFileIndices(true);
+                    return false;
+                }
+            }
+
+            if (_focusEditorSearch)
+            {
+                if (input.Keyboard.WasKeyPressed(Keys.Back) && _editorSearchText.Length > 0)
+                {
+                    _editorSearchText = _editorSearchText.Substring(0, _editorSearchText.Length - 1);
+                    RebuildSearchMatches();
+                    return false;
+                }
+
+                if (input.Keyboard.WasKeyPressed(Keys.Delete) && _editorSearchText.Length > 0)
+                {
+                    _editorSearchText = "";
+                    RebuildSearchMatches();
                     return false;
                 }
             }
@@ -238,7 +383,7 @@ namespace Config
                 HandleFileListKeys(input);
             }
 
-            return false;
+            return base.OnPlayerInput(input, controller, chatpad, gameTime);
         }
 
         private void EnsureInit(GraphicsDevice device)
@@ -275,14 +420,22 @@ namespace Config
 
             int filesWidth = (int)(_panelRect.Width * 0.30f);
             _filesRect = new Rectangle(_panelRect.Left + PanePadding, contentTop, filesWidth, contentHeight);
-            _editorRect = new Rectangle(_filesRect.Right + PanePadding, contentTop, _panelRect.Right - _filesRect.Right - PanePadding * 2, contentHeight);
+            _editorRect = new Rectangle(_filesRect.Right + PanePadding + PaneGutter, contentTop, _panelRect.Right - _filesRect.Right - PanePadding * 2 - PaneGutter, contentHeight);
             _statusRect = new Rectangle(_panelRect.Left + PanePadding, contentTop + contentHeight + 8, _panelRect.Width - PanePadding * 2, statusHeight);
-            _fileFilterRect = new Rectangle(_filesRect.Left + 8, _filesRect.Top + GetFileRowHeight() + FileHeaderExtraHeight + 6, _filesRect.Width - 16, InputBoxHeight);
+            _fileFilterRect = new Rectangle(_filesRect.Left + 8, _filesRect.Top + (GetFileRowHeight() + FileHeaderExtraHeight) + 6, _filesRect.Width - 16, InputBoxHeight);
+            _filesTabRect = new Rectangle(_filesRect.Left + 8, _filesRect.Top + 2, (_filesRect.Width - 20) / 2, GetFileRowHeight());
+            _recentTabRect = new Rectangle(_filesTabRect.Right + 4, _filesRect.Top + 2, (_filesRect.Width - 20) - _filesTabRect.Width - 4, GetFileRowHeight());
+            int editorSearchW = Math.Max(220, Math.Min(420, (int)(_editorRect.Width * 0.42f)));
+            int editorSearchH = Math.Max(22, _smallFont.LineSpacing + 8);
+            _editorSearchRect = new Rectangle(_editorRect.Right - editorSearchW - 8, _editorRect.Top + 4, editorSearchW, editorSearchH);
             int closeX = _panelRect.Right - PanePadding - ButtonWidth;
             _closeRect = new Rectangle(closeX, buttonsY, ButtonWidth, ButtonHeight);
             _refreshRect = new Rectangle(_closeRect.Left - ButtonGap - ButtonWidth, buttonsY, ButtonWidth, ButtonHeight);
-            _reloadRect = new Rectangle(_refreshRect.Left - ButtonGap - ButtonWidth, buttonsY, ButtonWidth, ButtonHeight);
-            _saveRect = new Rectangle(_reloadRect.Left - ButtonGap - ButtonWidth, buttonsY, ButtonWidth, ButtonHeight);
+            _restoreBakRect = new Rectangle(_refreshRect.Left - ButtonGap - ButtonWidth, buttonsY, ButtonWidth, ButtonHeight);
+            _validateRect = new Rectangle(_restoreBakRect.Left - ButtonGap - ButtonWidth, buttonsY, ButtonWidth, ButtonHeight);
+            _reloadRect = new Rectangle(_validateRect.Left - ButtonGap - ButtonWidth, buttonsY, ButtonWidth, ButtonHeight);
+            _reloadFileRect = new Rectangle(_reloadRect.Left - ButtonGap - ButtonWidth, buttonsY, ButtonWidth, ButtonHeight);
+            _saveRect = new Rectangle(_reloadFileRect.Left - ButtonGap - ButtonWidth, buttonsY, ButtonWidth, ButtonHeight);
         }
 
         private void DrawPanel(SpriteBatch sb)
@@ -296,6 +449,9 @@ namespace Config
 
             sb.Draw(_white, _filesRect, pane);
             sb.Draw(_white, _editorRect, pane);
+            // Hard visual gutter prevents any cross-pane text bleed from looking like overlap.
+            var gutterRect = new Rectangle(_filesRect.Right + PanePadding, _filesRect.Top, PaneGutter, _filesRect.Height);
+            sb.Draw(_white, gutterRect, bg);
             sb.Draw(_white, _statusRect, new Color(20, 24, 31, 255));
             DrawBorder(sb, _filesRect, new Color(62, 75, 95, 255));
             DrawBorder(sb, _editorRect, new Color(62, 75, 95, 255));
@@ -304,20 +460,10 @@ namespace Config
 
         private void DrawTitle(SpriteBatch sb)
         {
-            float sy = Screen.Adjuster.ScaleFactor.Y;
             var titlePos = new Vector2(_panelRect.Left + PanePadding, _panelRect.Top + PanePadding - 2);
-            var subPos = new Vector2(_panelRect.Left + PanePadding, titlePos.Y + _titleFont.LineSpacing * sy);
 
-            sb.DrawString(_titleFont, "Config", titlePos + new Vector2(1, 1), Color.Black);
-            sb.DrawString(_titleFont, "Config", titlePos, Color.White);
-
-            string runtimeRoot = GetRuntimeModsRoot();
-            string subtitle = string.IsNullOrEmpty(runtimeRoot)
-                ? "No !Mods folder found yet."
-                : "Editing live files from: " + runtimeRoot;
-
-            sb.DrawString(_smallFont, subtitle, subPos + new Vector2(1, 1), Color.Black);
-            sb.DrawString(_smallFont, subtitle, subPos, new Color(200, 210, 225, 255));
+            sb.DrawString(_titleFont, "Config v2", titlePos + new Vector2(1, 1), Color.Black);
+            sb.DrawString(_titleFont, "Config v2", titlePos, Color.White);
         }
 
         private void DrawStatus(SpriteBatch sb)
@@ -340,7 +486,10 @@ namespace Config
         private void DrawButtons(SpriteBatch sb)
         {
             DrawButton(sb, _saveRect, "SAVE", _dirty ? new Color(70, 118, 78, 255) : new Color(48, 58, 52, 255));
+            DrawButton(sb, _reloadFileRect, "RELOAD FILE", new Color(58, 65, 80, 255));
             DrawButton(sb, _reloadRect, "RELOAD ALL", new Color(58, 65, 80, 255));
+            DrawButton(sb, _validateRect, "VALIDATE", new Color(58, 65, 80, 255));
+            DrawButton(sb, _restoreBakRect, "RESTORE BAK", new Color(58, 65, 80, 255));
             DrawButton(sb, _refreshRect, "REFRESH LIST", new Color(58, 65, 80, 255));
             DrawButton(sb, _closeRect, "CLOSE", new Color(80, 58, 58, 255));
         }
@@ -354,47 +503,69 @@ namespace Config
 
         private void DrawFiles(SpriteBatch sb)
         {
+            if (HideLeftFileListContent)
+                return;
+
             int rowHeight = GetFileRowHeight();
             int visibleRows = GetVisibleFileRowCount();
-            int maxScroll = Math.Max(0, _visibleFileIndices.Count - visibleRows);
+            int maxScroll = Math.Max(0, _visibleRows.Count - visibleRows);
             if (_fileScroll > maxScroll) _fileScroll = maxScroll;
 
-            var titleRect = new Rectangle(_filesRect.Left, _filesRect.Top, _filesRect.Width, rowHeight + FileHeaderExtraHeight);
-            sb.Draw(_white, titleRect, new Color(34, 42, 54, 255));
-            DrawCenteredString(sb, _smallFont, "Config Files", titleRect, Color.White);
-            DrawInputBox(sb, _fileFilterRect, _fileFilterText, "Find file...", _focusFileFilter);
-            int y = _fileFilterRect.Bottom + FileContentTopGap;
+            if (!HideLeftHeaderAndFilter)
+            {
+                DrawButton(sb, _filesTabRect, "Config Files", !_showRecentTab ? new Color(56, 78, 118, 255) : new Color(34, 42, 54, 255));
+                DrawButton(sb, _recentTabRect, "Recent", _showRecentTab ? new Color(56, 78, 118, 255) : new Color(34, 42, 54, 255));
+                DrawInputBox(sb, _fileFilterRect, _fileFilterText, "Find file...", _focusFileFilter);
+            }
+
+            int y = GetFilesContentTop();
             int clipBottom = _filesRect.Bottom - 6;
             int textRightPadding = _fileScrollbarVisible ? (FileScrollbarWidth + FileScrollbarMargin * 3) : 16;
             for (int row = 0; row < visibleRows; row++)
             {
-                int visibleIndex = _fileScroll + row;
-                if (visibleIndex >= _visibleFileIndices.Count)
+                int rowIndex = _fileScroll + row;
+                if (rowIndex >= _visibleRows.Count)
                     break;
-                int index = _visibleFileIndices[visibleIndex];
+                var rowData = _visibleRows[rowIndex];
 
                 var itemRect = new Rectangle(_filesRect.Left + 6, y, _filesRect.Width - 12, rowHeight);
                 if (itemRect.Bottom > clipBottom)
                     break;
 
-                bool selected = index == _selectedFileIndex;
-                var fill = selected ? new Color(70, 98, 145, 255) : new Color(30, 36, 45, 255);
-                sb.Draw(_white, itemRect, fill);
+                if (rowData.IsGroup)
+                {
+                    bool expanded = _expandedGroups.Contains(rowData.GroupKey);
+                    sb.Draw(_white, itemRect, new Color(40, 52, 72, 255));
+                    string marker = expanded ? "[-] " : "[+] ";
+                    string label = marker + (rowData.GroupLabel ?? "Unknown");
+                    var gp = new Vector2(itemRect.Left + 8, itemRect.Top + FileRowPadding);
+                    string gtext = ClipText(_smallFont, label, itemRect.Width - textRightPadding);
+                    sb.DrawString(_smallFont, gtext, gp + new Vector2(1, 1), Color.Black);
+                    sb.DrawString(_smallFont, gtext, gp, new Color(225, 235, 255, 255));
+                }
+                else
+                {
+                    int index = rowData.FileIndex;
+                    bool selected = index == _selectedFileIndex;
+                    var fill = selected ? new Color(70, 98, 145, 255) : new Color(30, 36, 45, 255);
+                    sb.Draw(_white, itemRect, fill);
 
-                var pos = new Vector2(itemRect.Left + 8, itemRect.Top + FileRowPadding);
-                string text = ClipText(_smallFont, _files[index].DisplayPath, itemRect.Width - textRightPadding);
-                sb.DrawString(_smallFont, text, pos + new Vector2(1, 1), Color.Black);
-                sb.DrawString(_smallFont, text, pos, selected ? Color.White : new Color(210, 214, 220, 255));
+                    var pos = new Vector2(itemRect.Left + 20, itemRect.Top + FileRowPadding);
+                    string text = ClipText(_smallFont, _files[index].DisplayPath, itemRect.Width - textRightPadding - 12);
+                    sb.DrawString(_smallFont, text, pos + new Vector2(1, 1), Color.Black);
+                    sb.DrawString(_smallFont, text, pos, selected ? Color.White : new Color(210, 214, 220, 255));
+                }
 
                 y += GetFileRowStep();
             }
 
             DrawFileScrollbar(sb);
 
-            if (_visibleFileIndices.Count == 0)
+            if (_visibleRows.Count == 0)
             {
                 var msg = _files.Count == 0 ? "No config files were found under !Mods yet." : "No files match the filter.";
-                var pos = new Vector2(_filesRect.Left + 12, _fileFilterRect.Bottom + 12);
+                if (_showRecentTab) msg = "No recent files yet.";
+                var pos = new Vector2(_filesRect.Left + 12, y + 8);
                 sb.DrawString(_smallFont, msg, pos + new Vector2(1, 1), Color.Black);
                 sb.DrawString(_smallFont, msg, pos, Color.LightGray);
             }
@@ -402,22 +573,36 @@ namespace Config
 
         private void DrawEditor(SpriteBatch sb)
         {
-            int headerHeight = _smallFont.LineSpacing + 12;
+            int headerHeight = Math.Max(_smallFont.LineSpacing + 12, _editorSearchRect.Height + 8);
             var headerRect = new Rectangle(_editorRect.Left, _editorRect.Top, _editorRect.Width, headerHeight);
             sb.Draw(_white, headerRect, new Color(34, 42, 54, 255));
 
-            string title = _selectedFileIndex >= 0 ? _files[_selectedFileIndex].DisplayPath : "Editor";
-            DrawCenteredString(sb, _smallFont, title, headerRect, Color.White);
+            string title = "Editor";
+            if (_selectedFileIndex >= 0)
+            {
+                string display = _files[_selectedFileIndex].DisplayPath ?? "";
+                string fileName = Path.GetFileName(display);
+                title = string.IsNullOrWhiteSpace(fileName) ? display : fileName;
+            }
+            int titleLeftPad = 64;
+            int titleMaxWidth = Math.Max(100, _editorSearchRect.Left - (_editorRect.Left + titleLeftPad) - 12);
+            string titleClipped = ClipText(_smallFont, title, titleMaxWidth);
+            var titlePos = new Vector2(_editorRect.Left + titleLeftPad, _editorRect.Top + 6);
+            sb.DrawString(_smallFont, titleClipped, titlePos + new Vector2(1, 1), Color.Black);
+            sb.DrawString(_smallFont, titleClipped, titlePos, Color.White);
+            DrawInputBox(sb, _editorSearchRect, _editorSearchText, "Find in file... (Enter/F3 = next)", _focusEditorSearch);
 
             int lineHeight = _smallFont.LineSpacing + 2;
             int contentTop = headerRect.Bottom + 8;
-            int visibleLines = Math.Max(1, (_editorRect.Bottom - contentTop - 8) / lineHeight);
+            int diffPanelHeight = Math.Max(90, _smallFont.LineSpacing * 5 + 14);
+            int editorBottom = _editorRect.Bottom - diffPanelHeight - 6;
+            int visibleLines = Math.Max(1, (editorBottom - contentTop - 8) / lineHeight);
 
             if (_editorTopLine > Math.Max(0, _cachedLines.Count - visibleLines))
                 _editorTopLine = Math.Max(0, _cachedLines.Count - visibleLines);
 
             int lineNumberWidth = 56;
-            var lineRect = new Rectangle(_editorRect.Left + 8, contentTop, _editorRect.Width - 16, _editorRect.Height - headerHeight - 16);
+            var lineRect = new Rectangle(_editorRect.Left + 8, contentTop, _editorRect.Width - 16, editorBottom - contentTop);
             sb.Draw(_white, new Rectangle(lineRect.Left, lineRect.Top, lineNumberWidth, lineRect.Height), new Color(21, 25, 33, 255));
 
             for (int i = 0; i < visibleLines; i++)
@@ -433,9 +618,9 @@ namespace Config
                 sb.DrawString(_smallFont, number, numberPos, new Color(145, 155, 170, 255));
 
                 var textPos = new Vector2(lineRect.Left + lineNumberWidth + 10, y);
-                string clipped = ClipText(_smallFont, _cachedLines[lineIndex], lineRect.Width - lineNumberWidth - 20);
-                sb.DrawString(_smallFont, clipped, textPos + new Vector2(1, 1), Color.Black);
-                sb.DrawString(_smallFont, clipped, textPos, new Color(230, 230, 235, 255));
+                string lineText = _cachedLines[lineIndex];
+                DrawLineSearchHighlights(sb, lineText, lineIndex, textPos, lineRect.Width - lineNumberWidth - 20);
+                DrawSyntaxLine(sb, lineText, textPos, lineRect.Width - lineNumberWidth - 20);
             }
 
             if (_selectedFileIndex >= 0 && ((int)(_blinkTime * 2) % 2 == 0))
@@ -454,6 +639,79 @@ namespace Config
                     sb.Draw(_white, new Rectangle((int)x, (int)y, 2, _smallFont.LineSpacing + 1), Color.White);
                 }
             }
+
+            var diffRect = new Rectangle(_editorRect.Left + 8, _editorRect.Bottom - diffPanelHeight, _editorRect.Width - 16, diffPanelHeight - 8);
+            DrawDiffPanel(sb, diffRect);
+        }
+
+        private void DrawDiffPanel(SpriteBatch sb, Rectangle rect)
+        {
+            sb.Draw(_white, rect, new Color(21, 25, 33, 255));
+            DrawBorder(sb, rect, new Color(62, 75, 95, 255));
+
+            UpdateDiffStats();
+            string headline = "Diff  changed:" + _lastDiffChanged.ToString(CultureInfo.InvariantCulture)
+                            + "  added:" + _lastDiffAdded.ToString(CultureInfo.InvariantCulture)
+                            + "  removed:" + _lastDiffRemoved.ToString(CultureInfo.InvariantCulture);
+            var p = new Vector2(rect.Left + 8, rect.Top + 6);
+            sb.DrawString(_smallFont, headline, p + new Vector2(1, 1), Color.Black);
+            sb.DrawString(_smallFont, headline, p, Color.White);
+
+            if (!string.IsNullOrEmpty(_lastValidationMessage))
+            {
+                var pv = new Vector2(rect.Left + 8, p.Y + _smallFont.LineSpacing + 2);
+                sb.DrawString(_smallFont, _lastValidationMessage, pv + new Vector2(1, 1), Color.Black);
+                sb.DrawString(_smallFont, _lastValidationMessage, pv, _lastValidationColor);
+            }
+
+            string[] oldLines = (_lastLoadedText ?? "").Replace("\r\n", "\n").Split('\n');
+            string[] newLines = (_editorText ?? "").Replace("\r\n", "\n").Split('\n');
+            int row = 0;
+            int maxPreview = 3;
+            int previewTop = rect.Top + _smallFont.LineSpacing * 2 + 10;
+            int previewWidth = rect.Width - 16;
+            int max = Math.Max(oldLines.Length, newLines.Length);
+            for (int i = 0; i < max && row < maxPreview; i++)
+            {
+                string o = i < oldLines.Length ? oldLines[i] : null;
+                string n = i < newLines.Length ? newLines[i] : null;
+                if (o == n)
+                    continue;
+
+                string label;
+                Color c;
+                if (o == null) { label = "+ " + n; c = new Color(140, 220, 140, 255); }
+                else if (n == null) { label = "- " + o; c = new Color(235, 140, 140, 255); }
+                else { label = "~ " + n; c = new Color(235, 208, 120, 255); }
+
+                label = ClipText(_smallFont, label, previewWidth);
+                var lp = new Vector2(rect.Left + 8, previewTop + row * (_smallFont.LineSpacing + 2));
+                sb.DrawString(_smallFont, label, lp + new Vector2(1, 1), Color.Black);
+                sb.DrawString(_smallFont, label, lp, c);
+                row++;
+            }
+        }
+
+        private void UpdateDiffStats()
+        {
+            string[] oldLines = (_lastLoadedText ?? "").Replace("\r\n", "\n").Split('\n');
+            string[] newLines = (_editorText ?? "").Replace("\r\n", "\n").Split('\n');
+            int max = Math.Max(oldLines.Length, newLines.Length);
+            int changed = 0;
+            int added = 0;
+            int removed = 0;
+            for (int i = 0; i < max; i++)
+            {
+                string o = i < oldLines.Length ? oldLines[i] : null;
+                string n = i < newLines.Length ? newLines[i] : null;
+                if (o == n) continue;
+                if (o == null) added++;
+                else if (n == null) removed++;
+                else changed++;
+            }
+            _lastDiffChanged = changed;
+            _lastDiffAdded = added;
+            _lastDiffRemoved = removed;
         }
 
         private void HandleMouse(Point mousePoint, bool leftPressed)
@@ -470,15 +728,33 @@ namespace Config
                 return;
             }
 
+            if (_reloadFileRect.Contains(mousePoint))
+            {
+                ReloadSelectedFile();
+                return;
+            }
+
             if (_reloadRect.Contains(mousePoint))
             {
                 ReloadAllFiles();
                 return;
             }
 
+            if (_validateRect.Contains(mousePoint))
+            {
+                ValidateSelectedFile();
+                return;
+            }
+
+            if (_restoreBakRect.Contains(mousePoint))
+            {
+                RestoreSelectedBak();
+                return;
+            }
+
             if (_refreshRect.Contains(mousePoint))
             {
-                RefreshFileList();
+                BeginRefreshFileList();
                 return;
             }
 
@@ -494,17 +770,48 @@ namespace Config
                 return;
             }
 
-            if (_fileFilterRect.Contains(mousePoint))
+            if (!HideLeftHeaderAndFilter && _fileFilterRect.Contains(mousePoint))
             {
                 _focusEditor = false;
                 _focusFileFilter = true;
+                _focusEditorSearch = false;
+                DebugTrace("Filter box focused.");
+                return;
+            }
+
+            if (!HideLeftHeaderAndFilter && _filesTabRect.Contains(mousePoint))
+            {
+                _showRecentTab = false;
+                _fileScroll = 0;
+                RebuildVisibleFileIndices(true);
+                return;
+            }
+
+            if (!HideLeftHeaderAndFilter && _recentTabRect.Contains(mousePoint))
+            {
+                _showRecentTab = true;
+                _fileScroll = 0;
+                RebuildVisibleFileIndices(true);
+                return;
+            }
+
+            if (_editorSearchRect.Contains(mousePoint))
+            {
+                _focusEditor = false;
+                _focusFileFilter = false;
+                _focusEditorSearch = true;
                 return;
             }
 
             if (_filesRect.Contains(mousePoint))
             {
+                if (HideLeftFileListContent)
+                    return;
+
                 _focusEditor = false;
                 _focusFileFilter = false;
+                _focusEditorSearch = false;
+                DebugTrace($"Files pane click at ({mousePoint.X},{mousePoint.Y}), scroll={_fileScroll}, rows={_visibleRows.Count}, files={_visibleFileIndices.Count}");
                 ClickFileList(mousePoint);
                 return;
             }
@@ -513,6 +820,7 @@ namespace Config
             {
                 _focusEditor = true;
                 _focusFileFilter = false;
+                _focusEditorSearch = false;
                 PlaceCaretFromMouse(mousePoint);
             }
         }
@@ -561,6 +869,7 @@ namespace Config
             {
                 if (_caretIndex > 0)
                 {
+                    PushUndoBeforeEdit();
                     _editorText = _editorText.Remove(_caretIndex - 1, 1);
                     _caretIndex--;
                     RebuildTextCache();
@@ -575,6 +884,7 @@ namespace Config
             {
                 if (_caretIndex < _editorText.Length)
                 {
+                    PushUndoBeforeEdit();
                     _editorText = _editorText.Remove(_caretIndex, 1);
                     RebuildTextCache();
                     MarkDirty();
@@ -643,21 +953,48 @@ namespace Config
 
         private void ClickFileList(Point mousePoint)
         {
-            int rowHeight = GetFileRowHeight();
-            int headerBottom = _fileFilterRect.Bottom + FileContentTopGap;
+            int headerBottom = GetFilesContentTop();
             if (mousePoint.Y < headerBottom)
                 return;
 
             int row = (mousePoint.Y - headerBottom) / GetFileRowStep();
-            TrySelectVisibleFile(_fileScroll + row);
+            int rowIndex = _fileScroll + row;
+            DebugTrace($"ClickFileList row={row}, fileScroll={_fileScroll}, targetRowIndex={rowIndex}");
+            if (rowIndex < 0 || rowIndex >= _visibleRows.Count)
+                return;
+
+            var rowData = _visibleRows[rowIndex];
+            if (rowData.IsGroup)
+            {
+                ToggleGroupExpanded(rowData.GroupKey);
+                return;
+            }
+
+            TrySelectVisibleFileByRowIndex(rowIndex);
         }
 
         private void TrySelectVisibleFile(int visibleIndex)
         {
             if (visibleIndex < 0 || visibleIndex >= _visibleFileIndices.Count)
+            {
+                DebugTrace($"TrySelectVisibleFile ignored (index={visibleIndex}, visibleCount={_visibleFileIndices.Count})");
+                return;
+            }
+
+            DebugTrace($"TrySelectVisibleFile visibleIndex={visibleIndex} -> fileIndex={_visibleFileIndices[visibleIndex]}");
+            TrySelectFile(_visibleFileIndices[visibleIndex]);
+        }
+
+        private void TrySelectVisibleFileByRowIndex(int rowIndex)
+        {
+            if (rowIndex < 0 || rowIndex >= _visibleRows.Count)
                 return;
 
-            TrySelectFile(_visibleFileIndices[visibleIndex]);
+            var rowData = _visibleRows[rowIndex];
+            if (rowData.IsGroup || rowData.FileIndex < 0)
+                return;
+
+            TrySelectFile(rowData.FileIndex);
         }
 
         private int GetSelectedVisibleIndex()
@@ -671,15 +1008,21 @@ namespace Config
         private void TrySelectFile(int index)
         {
             if (index < 0 || index >= _files.Count)
+            {
+                DebugTrace($"TrySelectFile ignored (index={index}, fileCount={_files.Count})");
                 return;
+            }
 
             if (_dirty && index != _selectedFileIndex)
             {
+                DebugTrace($"TrySelectFile blocked by dirty state (current={_selectedFileIndex}, requested={index})");
                 SetStatus("Save or reload the current file before switching files.", Color.Yellow);
                 return;
             }
 
             _selectedFileIndex = index;
+            DebugTrace($"TrySelectFile selected index={index}, path={_files[index].DisplayPath}");
+            AddRecentPath(_files[index].FullPath);
             LoadSelectedFile();
             _focusEditor = true;
             EnsureSelectedFileVisible();
@@ -721,7 +1064,9 @@ namespace Config
                 _dirty = false;
                 _preferredColumn = -1;
                 RebuildTextCache();
+                RebuildSearchMatches();
                 _selectedFileLastWriteUtc = File.Exists(path) ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue;
+                DebugTrace($"LoadSelectedFile success path={_files[_selectedFileIndex].DisplayPath}, chars={_editorText.Length}");
                 SetStatus("Loaded " + _files[_selectedFileIndex].DisplayPath, Color.LightGreen);
             }
             catch (Exception ex)
@@ -731,7 +1076,9 @@ namespace Config
                 _caretIndex = 0;
                 _dirty = false;
                 RebuildTextCache();
+                RebuildSearchMatches();
                 _selectedFileLastWriteUtc = DateTime.MinValue;
+                DebugTrace($"LoadSelectedFile failed: {ex.Message}");
                 SetStatus("Failed to load file: " + ex.Message, Color.OrangeRed);
             }
         }
@@ -746,14 +1093,16 @@ namespace Config
 
             try
             {
-                File.WriteAllText(_files[_selectedFileIndex].FullPath, _editorText ?? "");
+                string path = _files[_selectedFileIndex].FullPath;
+                WriteBackupsBeforeSave(path);
+                File.WriteAllText(path, _editorText ?? "");
                 _lastLoadedText = _editorText;
                 _dirty = false;
                 RebuildTextCache();
-                _selectedFileLastWriteUtc = File.Exists(_files[_selectedFileIndex].FullPath)
-                    ? File.GetLastWriteTimeUtc(_files[_selectedFileIndex].FullPath)
+                _selectedFileLastWriteUtc = File.Exists(path)
+                    ? File.GetLastWriteTimeUtc(path)
                     : DateTime.MinValue;
-                SetStatus("Saved " + _files[_selectedFileIndex].DisplayPath, Color.LightGreen);
+                SetStatus("Saved " + _files[_selectedFileIndex].DisplayPath + " (+ .bak + history)", Color.LightGreen);
             }
             catch (Exception ex)
             {
@@ -769,35 +1118,302 @@ namespace Config
                 return;
             }
 
-            RefreshFileList();
-            SetStatus("Reloaded all config files from disk.", Color.LightGreen);
+            BeginRefreshFileList();
+            SetStatus("Reloading all config files from disk...", Color.LightGreen);
         }
 
-        private void RefreshFileList()
+        private void ReloadSelectedFile()
         {
+            if (_selectedFileIndex < 0 || _selectedFileIndex >= _files.Count)
+            {
+                SetStatus("Pick a config file first.", Color.Yellow);
+                return;
+            }
+
+            LoadSelectedFile();
+
+            string hotReloadMessage;
+            bool hotReloaded = TryHotReloadSelectedFile(out hotReloadMessage);
+            if (hotReloaded)
+            {
+                SetStatus("Reloaded + hot-reloaded " + _files[_selectedFileIndex].DisplayPath + " (" + hotReloadMessage + ")", Color.LightGreen);
+            }
+            else
+            {
+                SetStatus("Reloaded " + _files[_selectedFileIndex].DisplayPath + " (no hot-reload hook found)", Color.Yellow);
+            }
+        }
+
+        private bool TryHotReloadSelectedFile(out string detail)
+        {
+            detail = "";
+            try
+            {
+                if (_selectedFileIndex < 0 || _selectedFileIndex >= _files.Count)
+                {
+                    detail = "no file selected";
+                    return false;
+                }
+
+                string displayPath = _files[_selectedFileIndex].DisplayPath ?? "";
+                string modToken = GetModTokenFromDisplayPath(displayPath);
+                if (string.IsNullOrWhiteSpace(modToken))
+                {
+                    detail = "could not determine mod name";
+                    return false;
+                }
+
+                string wanted = NormalizeToken(modToken);
+                var loadedAssemblies = AppDomain.CurrentDomain.GetAssemblies();
+                if (loadedAssemblies == null || loadedAssemblies.Length == 0)
+                {
+                    detail = "no loaded assemblies";
+                    return false;
+                }
+
+                Assembly bestAssembly = null;
+                int bestScore = int.MinValue;
+                for (int i = 0; i < loadedAssemblies.Length; i++)
+                {
+                    var asm = loadedAssemblies[i];
+                    if (asm == null || asm.IsDynamic) continue;
+
+                    string asmName = "";
+                    try { asmName = asm.GetName().Name ?? ""; } catch { }
+                    string normAsm = NormalizeToken(asmName);
+                    if (string.IsNullOrEmpty(normAsm)) continue;
+
+                    int score = 0;
+                    if (normAsm == wanted) score = 1000;
+                    else if (normAsm.Contains(wanted) || wanted.Contains(normAsm)) score = 600;
+                    else continue;
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestAssembly = asm;
+                    }
+                }
+
+                if (bestAssembly == null)
+                {
+                    detail = "assembly not found for " + modToken;
+                    return false;
+                }
+
+                MethodInfo bestMethod = null;
+                object[] bestArgs = null;
+                int bestMethodScore = int.MinValue;
+                Type[] types;
+                try { types = bestAssembly.GetTypes(); }
+                catch (ReflectionTypeLoadException rtle) { types = rtle.Types.Where(t => t != null).ToArray(); }
+                catch { types = null; }
+
+                if (types == null || types.Length == 0)
+                {
+                    detail = "no types in " + bestAssembly.GetName().Name;
+                    return false;
+                }
+
+                for (int t = 0; t < types.Length; t++)
+                {
+                    var type = types[t];
+                    if (type == null) continue;
+
+                    MethodInfo[] methods;
+                    try
+                    {
+                        methods = type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    for (int m = 0; m < methods.Length; m++)
+                    {
+                        var method = methods[m];
+                        if (method == null) continue;
+                        var parameters = method.GetParameters();
+                        bool supportsNoArgs = parameters.Length == 0;
+                        bool supportsPathArg = parameters.Length == 1 && parameters[0].ParameterType == typeof(string);
+                        if (!supportsNoArgs && !supportsPathArg) continue;
+
+                        string name = method.Name ?? "";
+                        int nameScore = GetHotReloadMethodNameScore(name);
+                        if (nameScore <= 0) continue;
+
+                        int score = 0;
+                        score += nameScore;
+                        if (supportsNoArgs) score += 45;
+                        if (supportsPathArg) score += 35;
+
+                        string typeName = type.Name ?? "";
+                        if (typeName.IndexOf("Config", StringComparison.OrdinalIgnoreCase) >= 0) score += 120;
+                        if (typeName.IndexOf("Settings", StringComparison.OrdinalIgnoreCase) >= 0) score += 80;
+                        if (typeName.IndexOf("Store", StringComparison.OrdinalIgnoreCase) >= 0) score += 30;
+                        if (typeName.IndexOf(modToken, StringComparison.OrdinalIgnoreCase) >= 0) score += 40;
+
+                        string ns = type.Namespace ?? "";
+                        if (ns.StartsWith(bestAssembly.GetName().Name ?? "", StringComparison.OrdinalIgnoreCase)) score += 25;
+
+                        if (score > bestMethodScore)
+                        {
+                            bestMethodScore = score;
+                            bestMethod = method;
+                            bestArgs = supportsPathArg
+                                ? new object[] { _files[_selectedFileIndex].FullPath }
+                                : null;
+                        }
+                    }
+                }
+
+                if (bestMethod == null)
+                {
+                    detail = "no supported hot-reload hook in " + bestAssembly.GetName().Name;
+                    return false;
+                }
+
+                bestMethod.Invoke(null, bestArgs);
+                detail = bestMethod.DeclaringType.FullName + "." + bestMethod.Name + "()";
+                DebugTrace("Hot-reload invoked: " + detail + " for " + displayPath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                detail = ex.GetType().Name + ": " + ex.Message;
+                DebugTrace("Hot-reload failed: " + detail);
+                return false;
+            }
+        }
+
+        private static string GetModTokenFromDisplayPath(string displayPath)
+        {
+            if (string.IsNullOrWhiteSpace(displayPath))
+                return "";
+
+            char[] sep = new[] { '\\', '/' };
+            var parts = displayPath.Split(sep, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length > 0)
+                return parts[0];
+
+            return Path.GetFileNameWithoutExtension(displayPath) ?? "";
+        }
+
+        private static string NormalizeToken(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "";
+
+            var sb = new StringBuilder(value.Length);
+            for (int i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+                if (char.IsLetterOrDigit(c))
+                    sb.Append(char.ToLowerInvariant(c));
+            }
+
+            return sb.ToString();
+        }
+
+        private static int GetHotReloadMethodNameScore(string methodName)
+        {
+            if (string.IsNullOrWhiteSpace(methodName))
+                return 0;
+
+            if (string.Equals(methodName, "LoadApply", StringComparison.Ordinal))
+                return 1100;
+            if (string.Equals(methodName, "Reload", StringComparison.Ordinal))
+                return 1000;
+            if (string.Equals(methodName, "ReloadConfig", StringComparison.Ordinal))
+                return 980;
+            if (string.Equals(methodName, "LoadConfig", StringComparison.Ordinal))
+                return 940;
+            if (string.Equals(methodName, "ApplyConfig", StringComparison.Ordinal))
+                return 900;
+            if (string.Equals(methodName, "Apply", StringComparison.Ordinal))
+                return 820;
+            if (string.Equals(methodName, "Refresh", StringComparison.Ordinal))
+                return 760;
+            if (string.Equals(methodName, "OnConfigChanged", StringComparison.Ordinal))
+                return 740;
+
+            return 0;
+        }
+
+        private void BeginRefreshFileList()
+        {
+            if (_scanInProgress)
+            {
+                SetStatus("Config scan already in progress...", Color.LightGray);
+                return;
+            }
+
             string oldPath = (_selectedFileIndex >= 0 && _selectedFileIndex < _files.Count)
                 ? _files[_selectedFileIndex].FullPath
                 : null;
 
-            var items = new List<ConfigFileItem>();
-            string root = GetRuntimeModsRoot();
+            _scanInProgress = true;
+            SetStatus("Scanning config files...", Color.LightGray);
 
-            if (!string.IsNullOrEmpty(root) && Directory.Exists(root))
+            ThreadPool.QueueUserWorkItem(_ =>
             {
-                foreach (var path in EnumerateConfigPaths(root))
+                var items = new List<ConfigFileItem>();
+                string root = GetRuntimeModsRoot();
+
+                try
                 {
-                    string relative = path.Substring(root.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                    items.Add(new ConfigFileItem
+                    if (!string.IsNullOrEmpty(root) && Directory.Exists(root))
                     {
-                        FullPath = path,
-                        DisplayPath = relative
-                    });
+                        foreach (var path in EnumerateConfigPaths(root))
+                        {
+                            string relative = path.Substring(root.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                            items.Add(new ConfigFileItem
+                            {
+                                FullPath = path,
+                                DisplayPath = relative
+                            });
+                        }
+                    }
                 }
+                catch (Exception ex)
+                {
+                    DebugTrace("Background scan failed: " + ex.Message);
+                }
+
+                lock (_scanLock)
+                {
+                    _pendingScanItems = items.OrderBy(f => f.DisplayPath, StringComparer.OrdinalIgnoreCase).ToList();
+                    _pendingOldPath = oldPath;
+                    _hasPendingScanResult = true;
+                    _scanInProgress = false;
+                }
+            });
+        }
+
+        private void ApplyPendingScanResult()
+        {
+            List<ConfigFileItem> items = null;
+            string oldPath = null;
+
+            lock (_scanLock)
+            {
+                if (!_hasPendingScanResult)
+                    return;
+
+                items = _pendingScanItems ?? new List<ConfigFileItem>();
+                oldPath = _pendingOldPath;
+                _pendingScanItems = null;
+                _pendingOldPath = null;
+                _hasPendingScanResult = false;
             }
 
+            string root = GetRuntimeModsRoot();
             _files.Clear();
-            _files.AddRange(items.OrderBy(f => f.DisplayPath, StringComparer.OrdinalIgnoreCase));
+            _files.AddRange(items);
+            BuildGroupBuckets();
             RebuildVisibleFileIndices(false);
+            DebugTrace($"ApplyPendingScanResult found {_files.Count} files under root={root}");
 
             if (_visibleFileIndices.Count == 0)
             {
@@ -822,7 +1438,6 @@ namespace Config
 
             _selectedFileIndex = newIndex;
             LoadSelectedFile();
-            _lastFileListFingerprint = ComputeFileListFingerprint(root);
         }
 
         private string GetRuntimeModsRoot()
@@ -854,12 +1469,109 @@ namespace Config
             if (_caretIndex < 0) _caretIndex = 0;
             if (_caretIndex > _editorText.Length) _caretIndex = _editorText.Length;
 
+            PushUndoBeforeEdit();
             _editorText = _editorText.Insert(_caretIndex, text);
             _caretIndex += text.Length;
             _preferredColumn = -1;
             RebuildTextCache();
             MarkDirty();
             EnsureCaretVisible();
+        }
+
+        private string GetSelectedPathOrNull()
+        {
+            if (_selectedFileIndex < 0 || _selectedFileIndex >= _files.Count)
+                return null;
+            return _files[_selectedFileIndex].FullPath;
+        }
+
+        private UndoHistory GetUndoHistory(string path, bool create)
+        {
+            if (string.IsNullOrEmpty(path))
+                return null;
+
+            UndoHistory h;
+            if (_undoByPath.TryGetValue(path, out h))
+                return h;
+
+            if (!create)
+                return null;
+
+            h = new UndoHistory();
+            _undoByPath[path] = h;
+            return h;
+        }
+
+        private UndoState CaptureUndoState()
+        {
+            return new UndoState
+            {
+                Text = _editorText ?? "",
+                Caret = _caretIndex,
+                TopLine = _editorTopLine
+            };
+        }
+
+        private void ApplyUndoState(UndoState s)
+        {
+            if (s == null) return;
+            _editorText = s.Text ?? "";
+            _caretIndex = Math.Max(0, Math.Min(_editorText.Length, s.Caret));
+            _editorTopLine = Math.Max(0, s.TopLine);
+            RebuildTextCache();
+            _preferredColumn = -1;
+            MarkDirty();
+            EnsureCaretVisible();
+        }
+
+        private void PushUndoBeforeEdit()
+        {
+            string path = GetSelectedPathOrNull();
+            if (string.IsNullOrEmpty(path))
+                return;
+
+            var h = GetUndoHistory(path, true);
+            h.Undo.Push(CaptureUndoState());
+            while (h.Undo.Count > MaxUndoStatesPerFile)
+            {
+                // Trim oldest by rebuilding stack order.
+                var tmp = h.Undo.Reverse().Take(MaxUndoStatesPerFile).ToList();
+                h.Undo.Clear();
+                for (int i = tmp.Count - 1; i >= 0; i--) h.Undo.Push(tmp[i]);
+            }
+            h.Redo.Clear();
+        }
+
+        private void UndoEdit()
+        {
+            string path = GetSelectedPathOrNull();
+            var h = GetUndoHistory(path, false);
+            if (h == null || h.Undo.Count == 0)
+            {
+                SetStatus("Nothing to undo.", Color.Yellow);
+                return;
+            }
+
+            h.Redo.Push(CaptureUndoState());
+            var prev = h.Undo.Pop();
+            ApplyUndoState(prev);
+            SetStatus("Undo", Color.LightGreen);
+        }
+
+        private void RedoEdit()
+        {
+            string path = GetSelectedPathOrNull();
+            var h = GetUndoHistory(path, false);
+            if (h == null || h.Redo.Count == 0)
+            {
+                SetStatus("Nothing to redo.", Color.Yellow);
+                return;
+            }
+
+            h.Undo.Push(CaptureUndoState());
+            var next = h.Redo.Pop();
+            ApplyUndoState(next);
+            SetStatus("Redo", Color.LightGreen);
         }
 
         private void MoveCaretToLineBoundary(bool start)
@@ -935,6 +1647,494 @@ namespace Config
                 _cachedLines.Add("");
         }
 
+        private void RebuildSearchMatches()
+        {
+            _searchMatchIndices.Clear();
+            _activeSearchMatch = -1;
+
+            string term = (_editorSearchText ?? "").Trim();
+            if (string.IsNullOrEmpty(term) || string.IsNullOrEmpty(_editorText))
+                return;
+
+            int start = 0;
+            while (start < _editorText.Length)
+            {
+                int hit = _editorText.IndexOf(term, start, StringComparison.OrdinalIgnoreCase);
+                if (hit < 0)
+                    break;
+
+                _searchMatchIndices.Add(hit);
+                start = hit + Math.Max(1, term.Length);
+            }
+
+            if (_searchMatchIndices.Count == 0)
+            {
+                SetStatus("No matches for \"" + term + "\"", Color.Yellow);
+                return;
+            }
+
+            _activeSearchMatch = _searchMatchIndices.FindIndex(i => i >= _caretIndex);
+            if (_activeSearchMatch < 0)
+                _activeSearchMatch = 0;
+
+            SetStatus("Found " + _searchMatchIndices.Count.ToString(CultureInfo.InvariantCulture) + " match(es) for \"" + term + "\"", Color.LightGreen);
+        }
+
+        private void JumpToNextSearchMatch()
+        {
+            if (_searchMatchIndices.Count == 0)
+            {
+                string term = (_editorSearchText ?? "").Trim();
+                if (string.IsNullOrEmpty(term))
+                    SetStatus("Type in Find-in-file first.", Color.Yellow);
+                else
+                    SetStatus("No matches for \"" + term + "\"", Color.Yellow);
+                return;
+            }
+
+            if (_activeSearchMatch < 0 || _activeSearchMatch >= _searchMatchIndices.Count)
+                _activeSearchMatch = 0;
+            else
+                _activeSearchMatch = (_activeSearchMatch + 1) % _searchMatchIndices.Count;
+
+            _caretIndex = _searchMatchIndices[_activeSearchMatch];
+            _preferredColumn = -1;
+            EnsureCaretVisible();
+
+            int shown = _activeSearchMatch + 1;
+            int total = _searchMatchIndices.Count;
+            SetStatus("Match " + shown.ToString(CultureInfo.InvariantCulture) + "/" + total.ToString(CultureInfo.InvariantCulture), Color.LightGreen);
+        }
+
+        private void DrawLineSearchHighlights(SpriteBatch sb, string lineText, int lineIndex, Vector2 textPos, int maxWidth)
+        {
+            string term = (_editorSearchText ?? "").Trim();
+            if (string.IsNullOrEmpty(term) || string.IsNullOrEmpty(lineText))
+                return;
+
+            if (lineIndex < 0 || lineIndex >= _lineStarts.Count)
+                return;
+
+            int lineStart = _lineStarts[lineIndex];
+            int searchInLine = 0;
+            while (searchInLine < lineText.Length)
+            {
+                int localHit = lineText.IndexOf(term, searchInLine, StringComparison.OrdinalIgnoreCase);
+                if (localHit < 0)
+                    break;
+
+                string prefix = lineText.Substring(0, localHit);
+                string hitText = lineText.Substring(localHit, Math.Min(term.Length, lineText.Length - localHit));
+                float x = textPos.X + _smallFont.MeasureString(prefix).X;
+                float w = _smallFont.MeasureString(hitText).X;
+                if (x < textPos.X + maxWidth)
+                {
+                    float right = Math.Min(textPos.X + maxWidth, x + w);
+                    int drawW = Math.Max(1, (int)Math.Round(right - x));
+                    int drawX = (int)Math.Round(x);
+                    int drawY = (int)Math.Round(textPos.Y + 1);
+                    int drawH = Math.Max(1, _smallFont.LineSpacing - 1);
+
+                    bool isActive = _activeSearchMatch >= 0 &&
+                                    _activeSearchMatch < _searchMatchIndices.Count &&
+                                    _searchMatchIndices[_activeSearchMatch] == lineStart + localHit;
+
+                    Color c = isActive
+                        ? new Color(70, 190, 95, 210)
+                        : new Color(45, 130, 65, 160);
+                    sb.Draw(_white, new Rectangle(drawX, drawY, drawW, drawH), c);
+                }
+
+                searchInLine = localHit + Math.Max(1, term.Length);
+            }
+        }
+
+        private struct ColorToken
+        {
+            public string Text;
+            public Color Color;
+        }
+
+        private void DrawSyntaxLine(SpriteBatch sb, string lineText, Vector2 textPos, int maxWidth)
+        {
+            if (lineText == null)
+                lineText = "";
+
+            var tokens = TokenizeSyntaxLine(lineText);
+            float x = textPos.X;
+            float maxX = textPos.X + Math.Max(1, maxWidth);
+
+            for (int i = 0; i < tokens.Count; i++)
+            {
+                string text = tokens[i].Text ?? "";
+                if (text.Length == 0)
+                    continue;
+
+                float w = _smallFont.MeasureString(text).X;
+                if (x + w <= maxX)
+                {
+                    var p = new Vector2(x, textPos.Y);
+                    sb.DrawString(_smallFont, text, p + new Vector2(1, 1), Color.Black);
+                    sb.DrawString(_smallFont, text, p, tokens[i].Color);
+                    x += w;
+                    continue;
+                }
+
+                // Last visible token: clip to available width.
+                string clipped = ClipText(_smallFont, text, (int)Math.Max(1, maxX - x));
+                if (!string.IsNullOrEmpty(clipped))
+                {
+                    var p = new Vector2(x, textPos.Y);
+                    sb.DrawString(_smallFont, clipped, p + new Vector2(1, 1), Color.Black);
+                    sb.DrawString(_smallFont, clipped, p, tokens[i].Color);
+                }
+                break;
+            }
+        }
+
+        private void ValidateSelectedFile()
+        {
+            if (_selectedFileIndex < 0 || _selectedFileIndex >= _files.Count)
+            {
+                SetStatus("Pick a config file first.", Color.Yellow);
+                return;
+            }
+
+            string path = _files[_selectedFileIndex].FullPath;
+            string ext = Path.GetExtension(path) ?? "";
+            string text = _editorText ?? "";
+
+            string msg;
+            Color c;
+            if (ext.Equals(".json", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    string jerr;
+                    if (!ValidateJsonBasic(text, out jerr))
+                    {
+                        msg = jerr;
+                        c = Color.OrangeRed;
+                    }
+                    else
+                    {
+                        msg = "Validation OK (JSON).";
+                        c = Color.LightGreen;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    msg = "JSON error: " + ex.Message;
+                    c = Color.OrangeRed;
+                }
+            }
+            else if (ext.Equals(".xml", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var xd = new System.Xml.XmlDocument();
+                    xd.LoadXml(text);
+                    msg = "Validation OK (XML).";
+                    c = Color.LightGreen;
+                }
+                catch (System.Xml.XmlException xex)
+                {
+                    msg = "XML error line " + xex.LineNumber.ToString(CultureInfo.InvariantCulture)
+                        + ", pos " + xex.LinePosition.ToString(CultureInfo.InvariantCulture)
+                        + ": " + xex.Message;
+                    c = Color.OrangeRed;
+                }
+                catch (Exception ex)
+                {
+                    msg = "XML error: " + ex.Message;
+                    c = Color.OrangeRed;
+                }
+            }
+            else if (ext.Equals(".ini", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".cfg", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".conf", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".txt", StringComparison.OrdinalIgnoreCase)
+                || string.IsNullOrEmpty(ext))
+            {
+                int bad = 0;
+                var lines = text.Replace("\r\n", "\n").Split('\n');
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string t = lines[i].Trim();
+                    if (t.Length == 0 || t.StartsWith(";") || t.StartsWith("#")) continue;
+                    if (t.StartsWith("[") && t.EndsWith("]")) continue;
+                    if (t.Contains("=")) continue;
+                    bad++;
+                }
+                if (bad == 0) { msg = "Validation OK (INI-style)."; c = Color.LightGreen; }
+                else { msg = "INI-style warning: " + bad.ToString(CultureInfo.InvariantCulture) + " suspicious line(s)."; c = Color.Yellow; }
+            }
+            else
+            {
+                msg = "No validator for " + ext + " (edit/save still works).";
+                c = new Color(185, 195, 210, 255);
+            }
+
+            _lastValidationMessage = msg;
+            _lastValidationColor = c;
+            SetStatus(msg, c);
+        }
+
+        private static bool ValidateJsonBasic(string text, out string error)
+        {
+            int line = 1;
+            int col = 0;
+            bool inString = false;
+            bool escaped = false;
+            var stack = new Stack<char>();
+
+            for (int i = 0; i < (text ?? "").Length; i++)
+            {
+                char ch = text[i];
+                if (ch == '\n')
+                {
+                    line++;
+                    col = 0;
+                }
+                else
+                {
+                    col++;
+                }
+
+                if (inString)
+                {
+                    if (escaped)
+                    {
+                        escaped = false;
+                        continue;
+                    }
+
+                    if (ch == '\\')
+                    {
+                        escaped = true;
+                        continue;
+                    }
+
+                    if (ch == '"')
+                        inString = false;
+
+                    continue;
+                }
+
+                if (ch == '"')
+                {
+                    inString = true;
+                    continue;
+                }
+
+                if (ch == '{' || ch == '[')
+                {
+                    stack.Push(ch);
+                    continue;
+                }
+
+                if (ch == '}' || ch == ']')
+                {
+                    if (stack.Count == 0)
+                    {
+                        error = "JSON error line " + line.ToString(CultureInfo.InvariantCulture)
+                            + " pos " + col.ToString(CultureInfo.InvariantCulture)
+                            + ": unexpected '" + ch + "'";
+                        return false;
+                    }
+
+                    char open = stack.Pop();
+                    if ((open == '{' && ch != '}') || (open == '[' && ch != ']'))
+                    {
+                        error = "JSON error line " + line.ToString(CultureInfo.InvariantCulture)
+                            + " pos " + col.ToString(CultureInfo.InvariantCulture)
+                            + ": mismatched '" + ch + "'";
+                        return false;
+                    }
+                }
+            }
+
+            if (inString)
+            {
+                error = "JSON error: unterminated string literal.";
+                return false;
+            }
+
+            if (stack.Count > 0)
+            {
+                error = "JSON error: unclosed object/array.";
+                return false;
+            }
+
+            error = null;
+            return true;
+        }
+
+        private void RestoreSelectedBak()
+        {
+            if (_selectedFileIndex < 0 || _selectedFileIndex >= _files.Count)
+            {
+                SetStatus("Pick a config file first.", Color.Yellow);
+                return;
+            }
+
+            try
+            {
+                string path = _files[_selectedFileIndex].FullPath;
+                string bakPath = path + ".bak";
+                if (!File.Exists(bakPath))
+                {
+                    SetStatus("No .bak found for selected file.", Color.Yellow);
+                    return;
+                }
+
+                PushUndoBeforeEdit();
+                File.Copy(bakPath, path, true);
+                LoadSelectedFile();
+                SetStatus("Restored .bak for " + _files[_selectedFileIndex].DisplayPath, Color.LightGreen);
+            }
+            catch (Exception ex)
+            {
+                SetStatus("Restore .bak failed: " + ex.Message, Color.OrangeRed);
+            }
+        }
+
+        private void WriteBackupsBeforeSave(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+                return;
+
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.Copy(path, path + ".bak", true);
+                }
+            }
+            catch { }
+
+            try
+            {
+                if (!File.Exists(path))
+                    return;
+
+                string modsRoot = GetRuntimeModsRoot() ?? Path.GetDirectoryName(path);
+                string backupRoot = Path.Combine(modsRoot, "Config", "!Backups");
+                string rel = path;
+                if (!string.IsNullOrEmpty(modsRoot) && path.StartsWith(modsRoot, StringComparison.OrdinalIgnoreCase))
+                    rel = path.Substring(modsRoot.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+                string relDir = Path.GetDirectoryName(rel) ?? "";
+                string fileName = Path.GetFileName(path);
+                string safeDir = Path.Combine(backupRoot, relDir);
+                Directory.CreateDirectory(safeDir);
+                string stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
+                string histPath = Path.Combine(safeDir, fileName + "." + stamp + ".bak");
+                File.Copy(path, histPath, true);
+            }
+            catch { }
+        }
+
+        private void AddRecentPath(string fullPath)
+        {
+            if (string.IsNullOrEmpty(fullPath))
+                return;
+
+            _recentPaths.RemoveAll(p => string.Equals(p, fullPath, StringComparison.OrdinalIgnoreCase));
+            _recentPaths.Insert(0, fullPath);
+            if (_recentPaths.Count > MaxRecentFiles)
+                _recentPaths.RemoveRange(MaxRecentFiles, _recentPaths.Count - MaxRecentFiles);
+        }
+
+        private List<ColorToken> TokenizeSyntaxLine(string line)
+        {
+            var tokens = new List<ColorToken>(6);
+            string trimmed = (line ?? "").TrimStart();
+
+            Color def = new Color(230, 230, 235, 255);
+            Color comment = new Color(120, 155, 120, 255);
+            Color section = new Color(235, 208, 120, 255);
+            Color key = new Color(120, 190, 255, 255);
+            Color sep = new Color(180, 186, 196, 255);
+            Color val = new Color(233, 170, 122, 255);
+            Color num = new Color(190, 150, 255, 255);
+            Color truthy = new Color(140, 220, 140, 255);
+            Color falsy = new Color(235, 140, 140, 255);
+            Color tag = new Color(145, 180, 255, 255);
+
+            if (trimmed.StartsWith(";") || trimmed.StartsWith("#"))
+            {
+                tokens.Add(new ColorToken { Text = line, Color = comment });
+                return tokens;
+            }
+
+            if (trimmed.StartsWith("[") && trimmed.Contains("]"))
+            {
+                tokens.Add(new ColorToken { Text = line, Color = section });
+                return tokens;
+            }
+
+            // XML-ish
+            if (trimmed.StartsWith("<") && trimmed.Contains(">"))
+            {
+                tokens.Add(new ColorToken { Text = line, Color = tag });
+                return tokens;
+            }
+
+            // INI / key-value
+            int eq = line.IndexOf('=');
+            if (eq > 0)
+            {
+                string left = line.Substring(0, eq);
+                string right = eq + 1 < line.Length ? line.Substring(eq + 1) : "";
+                tokens.Add(new ColorToken { Text = left, Color = key });
+                tokens.Add(new ColorToken { Text = "=", Color = sep });
+                tokens.Add(new ColorToken { Text = right, Color = PickValueColor(right, val, num, truthy, falsy) });
+                return tokens;
+            }
+
+            // JSON-ish key:value
+            int colon = line.IndexOf(':');
+            if (colon > 0)
+            {
+                string left = line.Substring(0, colon);
+                string right = colon + 1 < line.Length ? line.Substring(colon + 1) : "";
+                tokens.Add(new ColorToken { Text = left, Color = key });
+                tokens.Add(new ColorToken { Text = ":", Color = sep });
+                tokens.Add(new ColorToken { Text = right, Color = PickValueColor(right, val, num, truthy, falsy) });
+                return tokens;
+            }
+
+            tokens.Add(new ColorToken { Text = line, Color = def });
+            return tokens;
+        }
+
+        private static Color PickValueColor(string valueText, Color val, Color num, Color truthy, Color falsy)
+        {
+            string t = (valueText ?? "").Trim();
+            if (t.Length == 0)
+                return val;
+
+            if ((t.StartsWith("\"") && t.EndsWith("\"")) || (t.StartsWith("'") && t.EndsWith("'")))
+                return val;
+
+            if (string.Equals(t, "true", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(t, "on", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(t, "yes", StringComparison.OrdinalIgnoreCase))
+                return truthy;
+
+            if (string.Equals(t, "false", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(t, "off", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(t, "no", StringComparison.OrdinalIgnoreCase))
+                return falsy;
+
+            double n;
+            if (double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out n))
+                return num;
+
+            return val;
+        }
+
         private int GetLineEnd(int line)
         {
             int start = _lineStarts[line];
@@ -1008,7 +2208,7 @@ namespace Config
         private void ScrollFileListBy(int deltaRows)
         {
             int visibleRows = GetVisibleFileRowCount();
-            int maxScroll = Math.Max(0, _visibleFileIndices.Count - visibleRows);
+            int maxScroll = Math.Max(0, _visibleRows.Count - visibleRows);
 
             _fileScroll += deltaRows;
             if (_fileScroll < 0)
@@ -1029,15 +2229,22 @@ namespace Config
 
         private int GetVisibleFileRowCount()
         {
-            int availableHeight = _filesRect.Height - (GetFileRowHeight() + FileHeaderExtraHeight + FileContentTopGap + InputBoxHeight + FileContentTopGap) - 6;
+            int availableHeight = (_filesRect.Bottom - 6) - GetFilesContentTop();
             return Math.Max(1, availableHeight / GetFileRowStep());
+        }
+
+        private int GetFilesContentTop()
+        {
+            if (HideLeftHeaderAndFilter)
+                return _filesRect.Top + 6;
+
+            return _filesRect.Top + (GetFileRowHeight() + FileHeaderExtraHeight) + 6 + InputBoxHeight + FileContentTopGap;
         }
 
         private void UpdateFileScrollbarRects()
         {
             int rowHeight = GetFileRowHeight();
-            int titleHeight = rowHeight + FileHeaderExtraHeight;
-            int contentTop = _filesRect.Top + titleHeight + FileContentTopGap + InputBoxHeight + FileContentTopGap;
+            int contentTop = GetFilesContentTop();
             int contentBottom = _filesRect.Bottom - 6;
             int trackHeight = Math.Max(8, contentBottom - contentTop);
 
@@ -1048,8 +2255,8 @@ namespace Config
                 trackHeight);
 
             int visibleRows = GetVisibleFileRowCount();
-            int totalRows = Math.Max(visibleRows, _visibleFileIndices.Count);
-            _fileScrollbarVisible = _visibleFileIndices.Count > visibleRows;
+            int totalRows = Math.Max(visibleRows, _visibleRows.Count);
+            _fileScrollbarVisible = _visibleRows.Count > visibleRows;
 
             if (!_fileScrollbarVisible)
             {
@@ -1061,7 +2268,7 @@ namespace Config
             int thumbHeight = Math.Max(FileScrollbarMinThumbHeight, (int)Math.Round(_fileScrollbarTrackRect.Height * visibleRatio));
             thumbHeight = Math.Min(thumbHeight, _fileScrollbarTrackRect.Height);
 
-            int maxScroll = Math.Max(1, _visibleFileIndices.Count - visibleRows);
+            int maxScroll = Math.Max(1, _visibleRows.Count - visibleRows);
             float scrollT = MathHelper.Clamp((float)_fileScroll / maxScroll, 0f, 1f);
             int travel = Math.Max(0, _fileScrollbarTrackRect.Height - thumbHeight);
             int thumbY = _fileScrollbarTrackRect.Top + (int)Math.Round(travel * scrollT);
@@ -1121,7 +2328,7 @@ namespace Config
             }
 
             int visibleRows = GetVisibleFileRowCount();
-            int maxScroll = Math.Max(0, _visibleFileIndices.Count - visibleRows);
+            int maxScroll = Math.Max(0, _visibleRows.Count - visibleRows);
             if (maxScroll <= 0)
                 return;
 
@@ -1139,7 +2346,7 @@ namespace Config
         private void JumpFileScrollbarTo(float scrollT)
         {
             int visibleRows = GetVisibleFileRowCount();
-            int maxScroll = Math.Max(0, _visibleFileIndices.Count - visibleRows);
+            int maxScroll = Math.Max(0, _visibleRows.Count - visibleRows);
 
             scrollT = MathHelper.Clamp(scrollT, 0f, 1f);
             _fileScroll = (int)Math.Round(maxScroll * scrollT);
@@ -1187,35 +2394,160 @@ namespace Config
             _statusColor = color;
         }
 
+        private void EnsureDebugPaths() { }
+
+        private void DebugTrace(string message)
+        {
+            // Debug file/log tracing removed in v2.
+        }
+
         private void RebuildVisibleFileIndices(bool keepSelectionVisible)
         {
             _visibleFileIndices.Clear();
+            _visibleRows.Clear();
             string filter = (_fileFilterText ?? "").Trim();
 
-            for (int i = 0; i < _files.Count; i++)
+            if (_showRecentTab)
             {
-                if (string.IsNullOrEmpty(filter) ||
-                    _files[i].DisplayPath.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
+                for (int r = 0; r < _recentPaths.Count; r++)
                 {
-                    _visibleFileIndices.Add(i);
+                    string rp = _recentPaths[r];
+                    int fi = _files.FindIndex(f => string.Equals(f.FullPath, rp, StringComparison.OrdinalIgnoreCase));
+                    if (fi < 0)
+                        continue;
+                    if (!string.IsNullOrEmpty(filter) &&
+                        _files[fi].DisplayPath.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+
+                    _visibleFileIndices.Add(fi);
+                    _visibleRows.Add(new FileListRow
+                    {
+                        IsGroup = false,
+                        FileIndex = fi,
+                        GroupKey = GetGroupKey(_files[fi]),
+                        GroupLabel = GetGroupLabel(_files[fi])
+                    });
+                }
+            }
+            else
+            {
+                bool hasFilter = !string.IsNullOrEmpty(filter);
+                for (int g = 0; g < _groupBuckets.Count; g++)
+                {
+                    var bucket = _groupBuckets[g];
+                    if (bucket == null)
+                        continue;
+
+                    bool groupMatch = hasFilter && bucket.Label.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
+                    var matched = new List<int>();
+                    for (int i = 0; i < bucket.FileIndices.Count; i++)
+                    {
+                        int fi = bucket.FileIndices[i];
+                        if (fi < 0 || fi >= _files.Count)
+                            continue;
+                        if (!hasFilter || groupMatch || _files[fi].DisplayPath.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
+                            matched.Add(fi);
+                    }
+
+                    if (matched.Count == 0)
+                        continue;
+
+                    _visibleRows.Add(new FileListRow
+                    {
+                        IsGroup = true,
+                        GroupKey = bucket.Key,
+                        GroupLabel = bucket.Label,
+                        FileIndex = -1
+                    });
+
+                    bool expanded = _expandedGroups.Contains(bucket.Key) || hasFilter;
+                    if (!expanded)
+                        continue;
+
+                    for (int m = 0; m < matched.Count; m++)
+                    {
+                        int fi = matched[m];
+                        _visibleFileIndices.Add(fi);
+                        _visibleRows.Add(new FileListRow
+                        {
+                            IsGroup = false,
+                            GroupKey = bucket.Key,
+                            GroupLabel = bucket.Label,
+                            FileIndex = fi
+                        });
+                    }
                 }
             }
 
-            if (_visibleFileIndices.Count == 0)
+            if (_visibleRows.Count == 0)
             {
                 _selectedFileIndex = -1;
                 _fileScroll = 0;
+                DebugTrace($"RebuildVisibleFileIndices -> 0 results (filter=\"{filter}\")");
                 return;
             }
 
             if (_selectedFileIndex < 0 || !_visibleFileIndices.Contains(_selectedFileIndex))
             {
-                _selectedFileIndex = _visibleFileIndices[0];
+                _selectedFileIndex = _visibleFileIndices.Count > 0 ? _visibleFileIndices[0] : -1;
                 if (keepSelectionVisible)
                     LoadSelectedFile();
             }
 
             EnsureSelectedFileVisible();
+            DebugTrace($"RebuildVisibleFileIndices -> rows={_visibleRows.Count}, visibleFiles={_visibleFileIndices.Count}, selected={_selectedFileIndex}, filter=\"{filter}\"");
+        }
+
+        private void BuildGroupBuckets()
+        {
+            _groupBuckets.Clear();
+            _expandedGroups.Clear();
+
+            var byKey = new Dictionary<string, GroupBucket>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < _files.Count; i++)
+            {
+                var item = _files[i];
+                string key = GetGroupKey(item);
+                GroupBucket bucket;
+                if (!byKey.TryGetValue(key, out bucket))
+                {
+                    bucket = new GroupBucket { Key = key, Label = GetGroupLabel(item) };
+                    byKey[key] = bucket;
+                    _groupBuckets.Add(bucket);
+                }
+                bucket.FileIndices.Add(i);
+            }
+        }
+
+        private void ToggleGroupExpanded(string groupKey)
+        {
+            if (string.IsNullOrEmpty(groupKey))
+                return;
+
+            if (_expandedGroups.Contains(groupKey))
+                _expandedGroups.Remove(groupKey);
+            else
+                _expandedGroups.Add(groupKey);
+
+            RebuildVisibleFileIndices(true);
+        }
+
+        private static string GetGroupKey(ConfigFileItem item)
+        {
+            if (item == null || string.IsNullOrWhiteSpace(item.DisplayPath))
+                return "_root";
+
+            var parts = item.DisplayPath.Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0)
+                return "_root";
+
+            return parts[0];
+        }
+
+        private static string GetGroupLabel(ConfigFileItem item)
+        {
+            string key = GetGroupKey(item);
+            return string.Equals(key, "_root", StringComparison.OrdinalIgnoreCase) ? "(Root)" : key;
         }
 
         private void DrawInputBox(SpriteBatch sb, Rectangle rect, string value, string placeholder, bool focused)
@@ -1250,40 +2582,28 @@ namespace Config
 
             try
             {
-                ulong fingerprint = ComputeFileListFingerprint(root);
-                if (fingerprint == _lastFileListFingerprint)
+                if (_selectedFileIndex < 0 || _selectedFileIndex >= _files.Count)
                     return;
 
-                RefreshFileList();
-                SetStatus("Hot-reload: detected config changes and reloaded all files.", Color.LightGreen);
-            }
-            catch { }
-        }
-
-        private static ulong ComputeFileListFingerprint(string root)
-        {
-            // Lightweight deterministic snapshot of relevant config files.
-            ulong hash = 1469598103934665603UL; // FNV-1a offset basis
-
-            if (string.IsNullOrEmpty(root) || !Directory.Exists(root))
-                return hash;
-
-            var files = EnumerateConfigPaths(root).ToArray();
-            Array.Sort(files, StringComparer.OrdinalIgnoreCase);
-
-            for (int i = 0; i < files.Length; i++)
-            {
-                string path = files[i];
-                var info = new FileInfo(path);
-                string stamp = path + "|" + info.Length.ToString(CultureInfo.InvariantCulture) + "|" + info.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture);
-                for (int c = 0; c < stamp.Length; c++)
+                string selectedPath = _files[_selectedFileIndex].FullPath;
+                if (!File.Exists(selectedPath))
                 {
-                    hash ^= stamp[c];
-                    hash *= 1099511628211UL; // FNV prime
+                    BeginRefreshFileList();
+                    SetStatus("Hot-reload: selected file was removed. Refreshing list...", Color.Yellow);
+                    return;
+                }
+
+                var writeUtc = File.GetLastWriteTimeUtc(selectedPath);
+                if (writeUtc != _selectedFileLastWriteUtc)
+                {
+                    LoadSelectedFile();
+                    SetStatus("Hot-reload: selected file changed on disk and was reloaded.", Color.LightGreen);
                 }
             }
-
-            return hash;
+            catch (Exception ex)
+            {
+                DebugTrace("PollHotReload exception: " + ex.Message);
+            }
         }
 
         private static IEnumerable<string> EnumerateConfigPaths(string root)
@@ -1309,10 +2629,14 @@ namespace Config
 
             var stack = new Stack<string>();
             stack.Push(root);
+            int visitedDirs = 0;
 
             while (stack.Count > 0)
             {
                 var dir = stack.Pop();
+                visitedDirs++;
+                if (visitedDirs > MaxEnumeratedDirectories)
+                    yield break;
 
                 string[] childDirs;
                 try
@@ -1331,6 +2655,18 @@ namespace Config
                         string name = Path.GetFileName(childDirs[d]);
                         if (skipDirs.Contains(name))
                             continue;
+
+                        try
+                        {
+                            var attrs = File.GetAttributes(childDirs[d]);
+                            if ((attrs & FileAttributes.ReparsePoint) != 0)
+                                continue;
+                        }
+                        catch
+                        {
+                            continue;
+                        }
+
                         stack.Push(childDirs[d]);
                     }
                 }

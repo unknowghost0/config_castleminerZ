@@ -12,7 +12,7 @@ namespace Config
     [Priority(Priority.Low)]
     public class Config : ModBase
     {
-        public Config() : base("Config", new Version("0.0.1"))
+        public Config() : base("Config", new Version("2.0.0"))
         {
             var game = CastleMinerZGame.Instance;
             if (game != null)

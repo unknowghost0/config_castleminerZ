@@ -373,6 +373,23 @@ namespace Config
                 return HasScreenInStack(uiGroup, typeof(ConfigScreen));
             }
 
+            private static bool IsConfigCurrentScreen()
+            {
+                var game = CastleMinerZGame.Instance;
+                if (game == null)
+                    return false;
+
+                var frontEndCurrent = game.FrontEnd?.CurrentScreen;
+                if (frontEndCurrent != null && typeof(ConfigScreen).IsAssignableFrom(frontEndCurrent.GetType()))
+                    return true;
+
+                var uiCurrent = game.GameScreen?._uiGroup?.CurrentScreen;
+                if (uiCurrent != null && typeof(ConfigScreen).IsAssignableFrom(uiCurrent.GetType()))
+                    return true;
+
+                return false;
+            }
+
             private static bool HasScreenInStack(ScreenGroup group, Type screenType)
             {
                 if (group == null || screenType == null)
@@ -525,17 +542,9 @@ namespace Config
             {
                 static bool Prefix(Screen __instance, ref bool __result)
                 {
-                    if (!HasConfigInAnyStack())
-                        return true;
-
-                    if (__instance is ConfigScreen)
-                        return true;
-
-                    // When Config is open, block every other screen in the
-                    // front-end stack so the main menu/options screens cannot
-                    // keep processing the same mouse and keyboard input.
-                    __result = false;
-                    return false;
+                    // Match the stable pattern used by LanternLandMap/TexturePacks/MoreAchievements:
+                    // do not globally block input for other screens.
+                    return true;
                 }
             }
 
@@ -544,8 +553,7 @@ namespace Config
             {
                 static void Postfix(ref bool __result)
                 {
-                    if (HasConfigInAnyStack())
-                        __result = false;
+                    // Intentionally no-op to avoid fighting vanilla/menu capture flow.
                 }
             }
 
@@ -554,8 +562,7 @@ namespace Config
             {
                 static void Postfix(ref bool __result)
                 {
-                    if (HasConfigInAnyStack())
-                        __result = true;
+                    // Intentionally no-op to avoid fighting vanilla/menu cursor flow.
                 }
             }
         }

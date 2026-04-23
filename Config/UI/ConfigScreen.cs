@@ -865,6 +865,9 @@ namespace Config
 
         private void HandleEditorKeys(InputManager input, Point mousePoint)
         {
+            var ks = Keyboard.GetState();
+            bool ctrlDown = ks.IsKeyDown(Keys.LeftControl) || ks.IsKeyDown(Keys.RightControl);
+
             if (input.Keyboard.WasKeyPressed(Keys.Back))
             {
                 if (_caretIndex > 0)
@@ -891,6 +894,29 @@ namespace Config
                     EnsureCaretVisible();
                 }
 
+                return;
+            }
+
+            if (ctrlDown && input.Keyboard.WasKeyPressed(Keys.C))
+            {
+                if (!string.IsNullOrEmpty(_editorText))
+                {
+                    System.Windows.Forms.Clipboard.SetText(_editorText);
+                }
+                return;
+            }
+
+            if (ctrlDown && input.Keyboard.WasKeyPressed(Keys.V))
+            {
+                try
+                {
+                    string pastedText = System.Windows.Forms.Clipboard.GetText();
+                    if (!string.IsNullOrEmpty(pastedText))
+                    {
+                        InsertText(pastedText);
+                    }
+                }
+                catch { }
                 return;
             }
 

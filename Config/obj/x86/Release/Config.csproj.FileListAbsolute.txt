@@ -5,3 +5,7 @@ C:\Users\Admin\Documents\cmz modded\CastleForge-main\CastleForge\Mods\Mod manage
 C:\Users\Admin\Documents\cmz modded\CastleForge-main\CastleForge\Mods\Config\obj\x86\Release\Config.csproj.AssemblyReference.cache
 C:\Users\Admin\Documents\cmz modded\CastleForge-main\CastleForge\Mods\Config\obj\x86\Release\Config.csproj.CoreCompileInputs.cache
 C:\Users\Admin\Documents\cmz modded\CastleForge-main\CastleForge\Mods\Config\obj\x86\Release\Config.dll
+C:\Users\Admin\Documents\cmz modded\CastleForge-main\CastleForge-main updated\Build\Release\!Mods\Config.dll
+C:\Users\Admin\Documents\cmz modded\CastleForge-main\CastleForge-main updated\CastleForge\Mods\Config\obj\x86\Release\Config.csproj.AssemblyReference.cache
+C:\Users\Admin\Documents\cmz modded\CastleForge-main\CastleForge-main updated\CastleForge\Mods\Config\obj\x86\Release\Config.csproj.CoreCompileInputs.cache
+C:\Users\Admin\Documents\cmz modded\CastleForge-main\CastleForge-main updated\CastleForge\Mods\Config\obj\x86\Release\Config.dll

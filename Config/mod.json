@@ -8,7 +8,8 @@
       "version": "2.0.1",
       "description": "A universal configuration manager for CastleForge mods",
       "dll_url": "https://github.com/unknowghost0/config_castleminerZ/releases/tag/configmod/Config.dll",
-      "page_url": "https://github.com/unknowghost0/config_castleminerZ"
+      "page_url": "https://github.com/unknowghost0/config_castleminerZ",
+      "preview_url": "preview.png"
     }
   ]
 }

@@ -1,99 +1,61 @@
-# Config (CastleMiner Z Mod)
+# Configuration Manager
 
-`Config` is a CastleMiner Z mod that adds an in-game config editor UI for files under the live `!Mods` folder.
+Universal configuration manager for CastleForge mods. Provides an intuitive interface for managing and organizing mod settings.
 
-## Features
+## What it does
+- Adds `Configuration Manager` to the main menu and pause menu.
+- Creates and manages `mod.json` configuration files for CastleForge mods.
+- Provides a user-friendly interface for viewing and editing mod settings.
+- Integrates with the CastleForge mod loader framework for persistent configuration storage.
 
-- In-game config file browser/editor
-- Save current file changes
-- Reload all config files from disk
-- Periodic hot-reload when config files change on disk
-- Mouse + keyboard file navigation
+## Configuration
 
-## What It Does
+Config mod stores settings in:
 
-`Config` gives you a live in-game way to manage text-based mod configs without tabbing out constantly.
+`<GameRoot>\!Mods\Config\<ModName>.json`
 
-- It scans the game runtime mods directory (`<GameFolder>\!Mods`).
-- It finds config-like file types:
-  - `.ini`
-  - `.cfg`
-  - `.config`
-  - `.json`
-  - `.xml`
-- It shows those files in a left pane.
-- It opens the selected file in a right-side text editor.
-- It lets you edit, save, reload, and refresh from inside the game UI.
+Each configuration file follows the standard CastleForge mod metadata format.
 
-## How It Works
+## Community repo workflow
 
-### 1) Menu injection and screen open
+The community repo is:
 
-The mod uses Harmony patches to insert a `Config` menu entry and open a custom UI screen when selected.
+`https://github.com/RussDev7/CastleForge-CommunityMods`
 
-- Main menu: adds `Config`
-- Pause/in-game menu: adds `Config`
-- Selection opens the custom `ConfigScreen`
+Each community entry lives in its own folder inside a category:
 
-### 2) File discovery
+- `Mods/<ProjectName>/`
+- `TexturePacks/<ProjectName>/`
+- `WeaponAddons/<ProjectName>/`
 
-When the screen opens (or you press refresh/reload all), it:
+Each entry folder should include:
 
-- Resolves runtime mods root from `AppDomain.CurrentDomain.BaseDirectory + "!Mods"`
-- Recursively enumerates allowed config file extensions
-- Builds a sorted list by display path
+- `mod.json`
+- `README.md`
+- `preview.png` or `preview.gif`
 
-### 3) Editor behavior
+## How to publish
 
-The editor is line-based text editing with:
+1. Prepare your configuration mod files:
+   - Ensure `mod.json` contains valid metadata (name, version, author, description)
+   - Create a meaningful `README.md` explaining what your config manages
+   - Provide a `preview.png` or `preview.gif` showing the interface or use case
 
-- caret movement
-- insert/delete
-- mouse placement
-- mouse-wheel vertical scroll
-- unsaved/dirty tracking
+2. Fork `RussDev7/CastleForge-CommunityMods`
 
-`Ctrl+S` writes the current file to disk.
+3. Copy your submission into the matching category folder:
+   - `Mods/<YourConfigName>/`
 
-### 4) Reload behavior
+4. Include:
+   - `mod.json`
+   - `README.md`
+   - `preview.png` or `preview.gif`
 
-`RELOAD ALL` re-scans and reloads config files from disk.
+5. Commit your changes
 
-- If there are unsaved edits in the current editor buffer, reload is blocked to avoid accidental data loss.
-
-### 5) Hot-reload behavior
-
-A periodic poll checks for file list/content changes by computing a deterministic fingerprint of discovered config files.
-
-- If fingerprint changed and editor is not dirty:
-  - file list is refreshed
-  - current file is reloaded
-  - status shows that hot-reload happened
-
-This makes external edits (for example from Notepad or another mod tool) show up automatically.
-
-### 6) Safety guards
-
-- Very large files are skipped (intended for config-sized files only).
-- UI warns before switching files when the current file has unsaved changes.
-
-## Build
-
-Project file:
-
-- `Config.csproj`
-
-Release build output:
-
-- `Build\Release\!Mods\Config.dll`
-
-## Install
-
-Copy `Config.dll` into your game mods folder:
-
-- `C:\Program Files (x86)\Steam\steamapps\common\CastleMiner Z\!Mods\`
+6. Open a pull request
 
 ## Notes
-
-- This mod is intended for config-sized text files (`.ini`, `.cfg`, `.config`, `.json`, `.xml`).
-- Very large files are intentionally skipped for safety/performance.
+- Config mod works alongside other CastleForge mods to provide centralized settings management
+- The community catalog system will automatically discover and index your mod once the PR is merged
+- Configuration files are human-readable JSON for easy sharing and version control

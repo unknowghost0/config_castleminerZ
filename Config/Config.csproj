@@ -31,7 +31,7 @@
     <ErrorReport>prompt</ErrorReport>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
-  <ItemGroup>
+  <ItemGroup Condition="'$(Platform)' == 'x86'">
     <Reference Include="0Harmony">
       <HintPath>$(ReferenceAssembliesRoot)Patching\0Harmony.dll</HintPath>
       <Private>False</Private>

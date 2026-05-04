@@ -50,6 +50,8 @@ namespace Config
         private Rectangle _closeRect;
         private Rectangle _fileScrollbarTrackRect;
         private Rectangle _fileScrollbarThumbRect;
+        private Rectangle _editorScrollbarTrackRect;
+        private Rectangle _editorScrollbarThumbRect;
         private Rectangle _fileFilterRect;
         private Rectangle _editorSearchRect;
 
@@ -64,6 +66,8 @@ namespace Config
         private int _editorTopLine;
         private int _caretIndex;
         private int _preferredColumn = -1;
+        private Keys _heldEditorArrowKey = Keys.None;
+        private double _nextEditorArrowRepeatTime;
 
         private bool _dirty;
         private string _editorText = "";
@@ -74,8 +78,12 @@ namespace Config
         private bool _mouseLeftWasDown;
         private bool _fileScrollbarVisible;
         private bool _draggingFileScrollbar;
+        private bool _editorScrollbarVisible;
+        private bool _draggingEditorScrollbar;
         private int _fileScrollbarDragStartMouseY;
         private int _fileScrollbarDragStartScroll;
+        private int _editorScrollbarDragStartMouseY;
+        private int _editorScrollbarDragStartScroll;
         private readonly List<string> _cachedLines = new List<string>();
         private readonly List<int> _lineStarts = new List<int>();
         private int _lastHotReloadPollTick;
@@ -146,6 +154,8 @@ namespace Config
         private const int PaneGutter = 10;
         private const int MaxRecentFiles = 24;
         private const int MaxUndoStatesPerFile = 100;
+        private const double EditorArrowRepeatInitialDelay = 0.28;
+        private const double EditorArrowRepeatInterval = 0.045;
         private static bool HideLeftHeaderAndFilter = false;
         private static bool HideLeftFileListContent = false;
 
@@ -273,6 +283,8 @@ namespace Config
 
             UpdateFileScrollbarRects();
             HandleFileScrollbar(input.Mouse, mousePoint);
+            UpdateEditorScrollbarRects();
+            HandleEditorScrollbar(input.Mouse, mousePoint);
 
             var ks = Keyboard.GetState();
             bool ctrlDown = ks.IsKeyDown(Keys.LeftControl) || ks.IsKeyDown(Keys.RightControl);
@@ -376,7 +388,7 @@ namespace Config
             HandleMouse(mousePoint, leftPressed);
             if (_focusEditor && _selectedFileIndex >= 0)
             {
-                HandleEditorKeys(input, mousePoint);
+                HandleEditorKeys(input, mousePoint, gameTime);
             }
             else if (!_focusFileFilter)
             {
@@ -462,8 +474,8 @@ namespace Config
         {
             var titlePos = new Vector2(_panelRect.Left + PanePadding, _panelRect.Top + PanePadding - 2);
 
-            sb.DrawString(_titleFont, "Config v2", titlePos + new Vector2(1, 1), Color.Black);
-            sb.DrawString(_titleFont, "Config v2", titlePos, Color.White);
+            sb.DrawString(_titleFont, "Mod Config v2.5", titlePos + new Vector2(1, 1), Color.Black);
+            sb.DrawString(_titleFont, "Mod Config v2.5", titlePos, Color.White);
         }
 
         private void DrawStatus(SpriteBatch sb)
@@ -601,8 +613,12 @@ namespace Config
             if (_editorTopLine > Math.Max(0, _cachedLines.Count - visibleLines))
                 _editorTopLine = Math.Max(0, _cachedLines.Count - visibleLines);
 
+            UpdateEditorScrollbarRects();
+
             int lineNumberWidth = 56;
             var lineRect = new Rectangle(_editorRect.Left + 8, contentTop, _editorRect.Width - 16, editorBottom - contentTop);
+            int editorScrollbarPadding = _editorScrollbarVisible ? (FileScrollbarWidth + FileScrollbarMargin * 3) : 0;
+            int lineTextWidth = lineRect.Width - lineNumberWidth - 20 - editorScrollbarPadding;
             sb.Draw(_white, new Rectangle(lineRect.Left, lineRect.Top, lineNumberWidth, lineRect.Height), new Color(21, 25, 33, 255));
 
             for (int i = 0; i < visibleLines; i++)
@@ -619,9 +635,11 @@ namespace Config
 
                 var textPos = new Vector2(lineRect.Left + lineNumberWidth + 10, y);
                 string lineText = _cachedLines[lineIndex];
-                DrawLineSearchHighlights(sb, lineText, lineIndex, textPos, lineRect.Width - lineNumberWidth - 20);
-                DrawSyntaxLine(sb, lineText, textPos, lineRect.Width - lineNumberWidth - 20);
+                DrawLineSearchHighlights(sb, lineText, lineIndex, textPos, lineTextWidth);
+                DrawSyntaxLine(sb, lineText, textPos, lineTextWidth);
             }
+
+            DrawEditorScrollbar(sb);
 
             if (_selectedFileIndex >= 0 && ((int)(_blinkTime * 2) % 2 == 0))
             {
@@ -720,6 +738,9 @@ namespace Config
                 return;
 
             if (HandleFileScrollbarClick(mousePoint))
+                return;
+
+            if (HandleEditorScrollbarClick(mousePoint))
                 return;
 
             if (_saveRect.Contains(mousePoint))
@@ -863,7 +884,7 @@ namespace Config
             }
         }
 
-        private void HandleEditorKeys(InputManager input, Point mousePoint)
+        private void HandleEditorKeys(InputManager input, Point mousePoint, GameTime gameTime)
         {
             var ks = Keyboard.GetState();
             bool ctrlDown = ks.IsKeyDown(Keys.LeftControl) || ks.IsKeyDown(Keys.RightControl);
@@ -926,23 +947,8 @@ namespace Config
                 return;
             }
 
-            if (input.Keyboard.WasKeyPressed(Keys.Left))
-            {
-                if (_caretIndex > 0)
-                    _caretIndex--;
-                _preferredColumn = -1;
-                EnsureCaretVisible();
+            if (HandleEditorArrowKeys(input, ks, gameTime))
                 return;
-            }
-
-            if (input.Keyboard.WasKeyPressed(Keys.Right))
-            {
-                if (_caretIndex < _editorText.Length)
-                    _caretIndex++;
-                _preferredColumn = -1;
-                EnsureCaretVisible();
-                return;
-            }
 
             if (input.Keyboard.WasKeyPressed(Keys.Home))
             {
@@ -956,24 +962,83 @@ namespace Config
                 return;
             }
 
-            if (input.Keyboard.WasKeyPressed(Keys.Up))
-            {
-                MoveCaretVertical(-1);
-                return;
-            }
-
-            if (input.Keyboard.WasKeyPressed(Keys.Down))
-            {
-                MoveCaretVertical(1);
-                return;
-            }
-
             if (input.Mouse.DeltaWheel != 0 && _editorRect.Contains(mousePoint))
             {
                 _editorTopLine -= Math.Sign(input.Mouse.DeltaWheel) * 3;
                 if (_editorTopLine < 0) _editorTopLine = 0;
                 int maxTop = Math.Max(0, _cachedLines.Count - GetVisibleEditorLineCount());
                 if (_editorTopLine > maxTop) _editorTopLine = maxTop;
+            }
+        }
+
+        private bool HandleEditorArrowKeys(InputManager input, KeyboardState ks, GameTime gameTime)
+        {
+            Keys key = Keys.None;
+            if (ks.IsKeyDown(Keys.Left)) key = Keys.Left;
+            else if (ks.IsKeyDown(Keys.Right)) key = Keys.Right;
+            else if (ks.IsKeyDown(Keys.Up)) key = Keys.Up;
+            else if (ks.IsKeyDown(Keys.Down)) key = Keys.Down;
+
+            if (key == Keys.None)
+            {
+                _heldEditorArrowKey = Keys.None;
+                _nextEditorArrowRepeatTime = 0;
+                return false;
+            }
+
+            bool pressed = input.Keyboard.WasKeyPressed(key);
+            double now = gameTime.TotalGameTime.TotalSeconds;
+            bool shouldMove = pressed;
+
+            if (pressed || key != _heldEditorArrowKey)
+            {
+                _heldEditorArrowKey = key;
+                _nextEditorArrowRepeatTime = now + EditorArrowRepeatInitialDelay;
+                if (!pressed)
+                    shouldMove = true;
+            }
+            else if (now >= _nextEditorArrowRepeatTime)
+            {
+                shouldMove = true;
+                _nextEditorArrowRepeatTime = now + EditorArrowRepeatInterval;
+            }
+
+            if (!shouldMove)
+                return true;
+
+            MoveCaretForArrowKey(key);
+            return true;
+        }
+
+        private void MoveCaretForArrowKey(Keys key)
+        {
+            if (key == Keys.Left)
+            {
+                if (_caretIndex > 0)
+                    _caretIndex--;
+                _preferredColumn = -1;
+                EnsureCaretVisible();
+                return;
+            }
+
+            if (key == Keys.Right)
+            {
+                if (_caretIndex < _editorText.Length)
+                    _caretIndex++;
+                _preferredColumn = -1;
+                EnsureCaretVisible();
+                return;
+            }
+
+            if (key == Keys.Up)
+            {
+                MoveCaretVertical(-1);
+                return;
+            }
+
+            if (key == Keys.Down)
+            {
+                MoveCaretVertical(1);
             }
         }
 
@@ -1020,7 +1085,11 @@ namespace Config
             if (rowData.IsGroup || rowData.FileIndex < 0)
                 return;
 
+            int scrollBeforeSelect = _fileScroll;
             TrySelectFile(rowData.FileIndex);
+            int visibleRows = GetVisibleFileRowCount();
+            int maxScroll = Math.Max(0, _visibleRows.Count - visibleRows);
+            _fileScroll = Math.Max(0, Math.Min(scrollBeforeSelect, maxScroll));
         }
 
         private int GetSelectedVisibleIndex()
@@ -2208,10 +2277,12 @@ namespace Config
 
         private int GetVisibleEditorLineCount()
         {
-            int headerHeight = _smallFont.LineSpacing + 12;
+            int headerHeight = Math.Max(_smallFont.LineSpacing + 12, _editorSearchRect.Height + 8);
             int lineHeight = _smallFont.LineSpacing + 2;
             int contentTop = _editorRect.Top + headerHeight + 8;
-            return Math.Max(1, (_editorRect.Bottom - contentTop - 8) / lineHeight);
+            int diffPanelHeight = Math.Max(90, _smallFont.LineSpacing * 5 + 14);
+            int editorBottom = _editorRect.Bottom - diffPanelHeight - 6;
+            return Math.Max(1, (editorBottom - contentTop - 8) / lineHeight);
         }
 
         private void EnsureSelectedFileVisible()
@@ -2378,9 +2449,122 @@ namespace Config
             _fileScroll = (int)Math.Round(maxScroll * scrollT);
         }
 
+        private void UpdateEditorScrollbarRects()
+        {
+            int headerHeight = Math.Max(_smallFont.LineSpacing + 12, _editorSearchRect.Height + 8);
+            int lineHeight = _smallFont.LineSpacing + 2;
+            int contentTop = _editorRect.Top + headerHeight + 8;
+            int diffPanelHeight = Math.Max(90, _smallFont.LineSpacing * 5 + 14);
+            int editorBottom = _editorRect.Bottom - diffPanelHeight - 6;
+            int trackHeight = Math.Max(8, editorBottom - contentTop);
+
+            _editorScrollbarTrackRect = new Rectangle(
+                _editorRect.Right - FileScrollbarMargin - FileScrollbarWidth,
+                contentTop,
+                FileScrollbarWidth,
+                trackHeight);
+
+            int visibleLines = GetVisibleEditorLineCount();
+            int totalLines = Math.Max(visibleLines, _cachedLines.Count);
+            _editorScrollbarVisible = _cachedLines.Count > visibleLines;
+
+            if (!_editorScrollbarVisible)
+            {
+                _editorScrollbarThumbRect = new Rectangle(_editorScrollbarTrackRect.X, _editorScrollbarTrackRect.Y, _editorScrollbarTrackRect.Width, _editorScrollbarTrackRect.Height);
+                return;
+            }
+
+            float visibleRatio = (float)visibleLines / totalLines;
+            int thumbHeight = Math.Max(FileScrollbarMinThumbHeight, (int)Math.Round(_editorScrollbarTrackRect.Height * visibleRatio));
+            thumbHeight = Math.Min(thumbHeight, _editorScrollbarTrackRect.Height);
+
+            int maxScroll = Math.Max(1, _cachedLines.Count - visibleLines);
+            float scrollT = MathHelper.Clamp((float)_editorTopLine / maxScroll, 0f, 1f);
+            int travel = Math.Max(0, _editorScrollbarTrackRect.Height - thumbHeight);
+            int thumbY = _editorScrollbarTrackRect.Top + (int)Math.Round(travel * scrollT);
+
+            _editorScrollbarThumbRect = new Rectangle(_editorScrollbarTrackRect.X, thumbY, _editorScrollbarTrackRect.Width, thumbHeight);
+        }
+
+        private void DrawEditorScrollbar(SpriteBatch sb)
+        {
+            UpdateEditorScrollbarRects();
+            if (!_editorScrollbarVisible)
+                return;
+
+            sb.Draw(_white, _editorScrollbarTrackRect, new Color(18, 22, 29, 255));
+            DrawBorder(sb, _editorScrollbarTrackRect, new Color(58, 68, 84, 255));
+
+            var thumbColor = _draggingEditorScrollbar
+                ? new Color(136, 156, 192, 255)
+                : new Color(92, 111, 146, 255);
+            sb.Draw(_white, _editorScrollbarThumbRect, thumbColor);
+            DrawBorder(sb, _editorScrollbarThumbRect, new Color(150, 168, 196, 255));
+        }
+
+        private bool HandleEditorScrollbarClick(Point mousePoint)
+        {
+            UpdateEditorScrollbarRects();
+            if (!_editorScrollbarVisible)
+                return false;
+
+            if (_editorScrollbarThumbRect.Contains(mousePoint))
+            {
+                _draggingEditorScrollbar = true;
+                _editorScrollbarDragStartMouseY = mousePoint.Y;
+                _editorScrollbarDragStartScroll = _editorTopLine;
+                return true;
+            }
+
+            if (_editorScrollbarTrackRect.Contains(mousePoint))
+            {
+                float clickT = (float)(mousePoint.Y - _editorScrollbarTrackRect.Top) / Math.Max(1, _editorScrollbarTrackRect.Height);
+                JumpEditorScrollbarTo(clickT);
+                return true;
+            }
+
+            return false;
+        }
+
+        private void HandleEditorScrollbar(MouseInput mouse, Point mousePoint)
+        {
+            if (!_draggingEditorScrollbar)
+                return;
+
+            if (!mouse.LeftButtonDown)
+            {
+                _draggingEditorScrollbar = false;
+                return;
+            }
+
+            int visibleLines = GetVisibleEditorLineCount();
+            int maxScroll = Math.Max(0, _cachedLines.Count - visibleLines);
+            if (maxScroll <= 0)
+                return;
+
+            int travel = Math.Max(1, _editorScrollbarTrackRect.Height - _editorScrollbarThumbRect.Height);
+            int dy = mousePoint.Y - _editorScrollbarDragStartMouseY;
+            float deltaT = (float)dy / travel;
+            _editorTopLine = _editorScrollbarDragStartScroll + (int)Math.Round(deltaT * maxScroll);
+
+            if (_editorTopLine < 0)
+                _editorTopLine = 0;
+            if (_editorTopLine > maxScroll)
+                _editorTopLine = maxScroll;
+        }
+
+        private void JumpEditorScrollbarTo(float scrollT)
+        {
+            int visibleLines = GetVisibleEditorLineCount();
+            int maxScroll = Math.Max(0, _cachedLines.Count - visibleLines);
+
+            scrollT = MathHelper.Clamp(scrollT, 0f, 1f);
+            _editorTopLine = (int)Math.Round(maxScroll * scrollT);
+        }
+
         private void PlaceCaretFromMouse(Point mousePoint)
         {
-            int headerHeight = _smallFont.LineSpacing + 12;
+            int headerHeight = Math.Max(_smallFont.LineSpacing + 12, _editorSearchRect.Height + 8);
             int lineHeight = _smallFont.LineSpacing + 2;
             int contentTop = _editorRect.Top + headerHeight + 8;
             int lineNumberWidth = 56;
@@ -2550,12 +2734,18 @@ namespace Config
             if (string.IsNullOrEmpty(groupKey))
                 return;
 
+            int scrollBeforeToggle = _fileScroll;
+
             if (_expandedGroups.Contains(groupKey))
                 _expandedGroups.Remove(groupKey);
             else
                 _expandedGroups.Add(groupKey);
 
             RebuildVisibleFileIndices(true);
+
+            int visibleRows = GetVisibleFileRowCount();
+            int maxScroll = Math.Max(0, _visibleRows.Count - visibleRows);
+            _fileScroll = Math.Max(0, Math.Min(scrollBeforeToggle, maxScroll));
         }
 
         private static string GetGroupKey(ConfigFileItem item)

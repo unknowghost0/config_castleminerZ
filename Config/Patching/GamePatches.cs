@@ -469,7 +469,7 @@ namespace Config
             {
                 static void Postfix(MainMenu __instance)
                 {
-                    var item = __instance.AddMenuItem("Config", MenuItemRegistry.Tag);
+                    var item = __instance.AddMenuItem("Mod Config", MenuItemRegistry.Tag);
                     MenuItemRegistry.Remember(__instance, item);
                     MenuOrderHelper.PlaceAbove(__instance, "Options");
                 }
@@ -482,7 +482,7 @@ namespace Config
                 {
                     if (MenuItemRegistry.Get(__instance) == null)
                     {
-                        var item = __instance.AddMenuItem("Config", MenuItemRegistry.Tag);
+                        var item = __instance.AddMenuItem("Mod Config", MenuItemRegistry.Tag);
                         MenuItemRegistry.Remember(__instance, item);
                     }
 
@@ -495,7 +495,7 @@ namespace Config
             {
                 static void Postfix(InGameMenu __instance)
                 {
-                    var item = __instance.AddMenuItem("Config", MenuItemRegistry.Tag);
+                    var item = __instance.AddMenuItem("Mod Config", MenuItemRegistry.Tag);
                     MenuItemRegistry.Remember(__instance, item);
                     MenuOrderHelper.PlaceAbove(__instance, "Options");
                 }
@@ -508,7 +508,7 @@ namespace Config
                 {
                     if (MenuItemRegistry.Get(__instance) == null)
                     {
-                        var item = __instance.AddMenuItem("Config", MenuItemRegistry.Tag);
+                        var item = __instance.AddMenuItem("Mod Config", MenuItemRegistry.Tag);
                         MenuItemRegistry.Remember(__instance, item);
                     }
 

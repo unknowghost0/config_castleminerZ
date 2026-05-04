@@ -2,7 +2,7 @@
   "name": "ModConfig",
   "displayName": "Configuration Manager",
   "author": "unknowghost",
-  "version": "2.0.1",
+  "version": "2.5.0",
   "description": "A universal configuration manager for CastleForge mods. Provides an intuitive interface for configuring mod settings.",
   "tags": ["utility", "configuration", "settings"],
   "dll_url": "https://github.com/unknowghost0/config_castleminerZ/releases/download/v2.0.1/Config.dll",

@@ -1,4 +1,0 @@
-C:\Users\Admin\Documents\cmz modded\CastleForge-main\Build\Debug\!Mods\ModManager.dll
-C:\Users\Admin\Documents\cmz modded\CastleForge-main\CastleForge\Mods\Mod manager\obj\x86\Debug\ModManager.csproj.AssemblyReference.cache
-C:\Users\Admin\Documents\cmz modded\CastleForge-main\CastleForge\Mods\Mod manager\obj\x86\Debug\ModManager.csproj.CoreCompileInputs.cache
-C:\Users\Admin\Documents\cmz modded\CastleForge-main\CastleForge\Mods\Mod manager\obj\x86\Debug\ModManager.dll
